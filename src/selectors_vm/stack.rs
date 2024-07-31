@@ -37,6 +37,11 @@ fn is_void_element(local_name: &LocalName<'_>, enable_esi_tags: bool) -> bool {
     false
 }
 
+#[inline]
+fn can_be_void_element(local_name: &LocalName) -> bool {
+    tag_is_one_of!(*local_name, [Iframe])
+}
+
 pub(crate) trait ElementData: Default + 'static {
     type MatchPayload: PartialEq + Eq + Copy + Debug + Hash + 'static;
 
@@ -268,6 +273,8 @@ impl<E: ElementData> Stack<E> {
         if ns == Namespace::Html {
             if is_void_element(&item.local_name, enable_esi_tags) {
                 StackDirective::PopImmediately
+            } else if can_be_void_element(&item.local_name) {
+                StackDirective::PushIfNotSelfClosing
             } else {
                 StackDirective::Push
             }
