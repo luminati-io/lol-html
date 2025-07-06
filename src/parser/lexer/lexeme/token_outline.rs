@@ -1,9 +1,9 @@
 use crate::base::{Align, Range};
 use crate::html::{LocalNameHash, Namespace, TextType};
-use crate::parser::SharedAttributeBuffer;
+use crate::parser::AttributeBuffer;
 
 #[derive(Debug, Default, Copy, Clone)]
-pub struct AttributeOutline {
+pub(crate) struct AttributeOutline {
     pub name: Range,
     pub value: Range,
     pub raw_range: Range,
@@ -19,12 +19,12 @@ impl Align for AttributeOutline {
 }
 
 #[derive(Debug)]
-pub enum TagTokenOutline {
+pub(crate) enum TagTokenOutline {
     StartTag {
         name: Range,
         name_hash: LocalNameHash,
         ns: Namespace,
-        attributes: SharedAttributeBuffer,
+        attributes: AttributeBuffer,
         self_closing: bool,
     },
 
@@ -35,7 +35,7 @@ pub enum TagTokenOutline {
 }
 
 #[derive(Debug)]
-pub enum NonTagContentTokenOutline {
+pub(crate) enum NonTagContentTokenOutline {
     Text(TextType),
     Comment(Range),
 
@@ -53,13 +53,13 @@ impl Align for TagTokenOutline {
     #[inline]
     fn align(&mut self, offset: usize) {
         match self {
-            TagTokenOutline::StartTag {
+            Self::StartTag {
                 name, attributes, ..
             } => {
                 name.align(offset);
-                attributes.borrow_mut().align(offset);
+                attributes.as_mut_slice().align(offset);
             }
-            TagTokenOutline::EndTag { name, .. } => name.align(offset),
+            Self::EndTag { name, .. } => name.align(offset),
         }
     }
 }
@@ -68,8 +68,8 @@ impl Align for NonTagContentTokenOutline {
     #[inline]
     fn align(&mut self, offset: usize) {
         match self {
-            NonTagContentTokenOutline::Comment(text) => text.align(offset),
-            NonTagContentTokenOutline::Doctype {
+            Self::Comment(text) => text.align(offset),
+            Self::Doctype {
                 name,
                 public_id,
                 system_id,

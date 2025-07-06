@@ -1,8 +1,8 @@
+use encoding_rs::UTF_8;
+use getopts::{Matches, Options};
 use lol_html::errors::*;
 use lol_html::html_content::*;
 use lol_html::*;
-use encoding_rs::UTF_8;
-use getopts::{Matches, Options};
 use std::env::args;
 
 fn parse_options() -> Option<Matches> {
@@ -32,7 +32,7 @@ fn parse_options() -> Option<Matches> {
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{e}");
             None
         }
     };
@@ -52,8 +52,8 @@ struct TraceTransformController {
 }
 
 impl TraceTransformController {
-    pub fn new(tag_hint_mode: bool) -> Self {
-        TraceTransformController {
+    pub const fn new(tag_hint_mode: bool) -> Self {
+        Self {
             capture_flags: if tag_hint_mode {
                 TokenCaptureFlags::empty()
             } else {
@@ -68,11 +68,11 @@ impl TransformController for TraceTransformController {
         self.capture_flags
     }
 
-    fn handle_start_tag(&mut self, _: LocalName, _: Namespace) -> StartTagHandlingResult<Self> {
+    fn handle_start_tag(&mut self, _: LocalName<'_>, _: Namespace) -> StartTagHandlingResult<Self> {
         Ok(self.capture_flags)
     }
 
-    fn handle_end_tag(&mut self, _: LocalName) -> TokenCaptureFlags {
+    fn handle_end_tag(&mut self, _: LocalName<'_>) -> TokenCaptureFlags {
         self.capture_flags
     }
 
@@ -102,14 +102,14 @@ fn main() {
         transform_controller: TraceTransformController::new(tag_hint_mode),
         output_sink: |_: &[u8]| {},
         preallocated_parsing_buffer_size: 0,
-        memory_limiter: MemoryLimiter::new_shared(2048),
+        memory_limiter: SharedMemoryLimiter::new(2048),
         encoding: SharedEncoding::new(AsciiCompatibleEncoding::new(UTF_8).unwrap()),
         strict: true,
     });
 
     let parser = transform_stream.parser();
 
-    parser.switch_text_type(match matches.opt_str("t").as_ref().map(String::as_str) {
+    parser.switch_text_type(match matches.opt_str("t").as_deref() {
         None => TextType::Data,
         Some(state) => TextType::from(state),
     });

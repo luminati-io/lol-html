@@ -1,6 +1,41 @@
 # Changelog
 
+## v2.5.0
+
+- Source code locations for tags and other tokens.
+- Document text chunks and escaping of attributes.
+- Selector validation improvements.
+
+## v2.4.0
+
+ - Upgraded `selectors` and `cssparser`.
+
+## v2.3.0
+
+ - Added `element.onEndTag` to JS bindings.
+ - Refactored TextDecoder and token construction to avoid heap allocations.
+ - Added fast paths for UTF-8 rewrites.
+
+## v2.2.0
+
+ - Updated cssparser and selectors dependencies
+ - Adopted `cargo-c` for building the C API
+ - Added WASM/JS API
+ - An invalid `/>` syntax will be removed when content is added to an HTML element
+
+## v2.1.0
+
+- Added streaming handlers.
+- Only allow changing the charset once with the `<meta>` tag, in accordance with the HTML spec.
+- Fixed parsing of invalid elements in `<svg>` and `<math>`.
+
+## v2.0.0
+
+- Added the ability for the rewriter to be [`Send`](https://doc.rust-lang.org/std/marker/trait.Send.html).
+  The `send` module contains the utilities for that.
+
 ## v1.2.1
+
 - Remove unmaintained `safemem` dependency.
 
 ## v1.2.0

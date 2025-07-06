@@ -20,13 +20,13 @@ struct ExternHandler<F> {
 }
 
 impl<F> ExternHandler<F> {
-    fn new(func: Option<F>, user_data: *mut c_void) -> Self {
-        ExternHandler { func, user_data }
+    const fn new(func: Option<F>, user_data: *mut c_void) -> Self {
+        Self { func, user_data }
     }
 }
 
 macro_rules! add_handler {
-    ($handlers:ident, $self:ident.$ty:ident) => {{
+    ($handlers:ident, $el_ty:ident, $self:ident.$ty:ident) => {{
         if let Some(handler) = $self.$ty.func {
             // NOTE: the closure actually holds a reference to the content
             // handler object, but since we pass the object to the C side this
@@ -41,7 +41,7 @@ macro_rules! add_handler {
 
             $handlers =
                 $handlers.$ty(
-                    move |arg: &mut _| match unsafe { handler(arg, user_data) } {
+                    move |arg: &mut $el_ty| match unsafe { handler(arg, user_data) } {
                         RewriterDirective::Continue => Ok(()),
                         RewriterDirective::Stop => Err("The rewriter has been stopped.".into()),
                     },
@@ -58,13 +58,14 @@ pub struct ExternDocumentContentHandlers {
 }
 
 impl ExternDocumentContentHandlers {
-    pub fn as_safe_document_content_handlers(&self) -> DocumentContentHandlers {
+    #[must_use]
+    pub fn as_safe_document_content_handlers(&self) -> DocumentContentHandlers<'_> {
         let mut handlers = DocumentContentHandlers::default();
 
-        add_handler!(handlers, self.doctype);
-        add_handler!(handlers, self.comments);
-        add_handler!(handlers, self.text);
-        add_handler!(handlers, self.end);
+        add_handler!(handlers, Doctype, self.doctype);
+        add_handler!(handlers, Comment, self.comments);
+        add_handler!(handlers, TextChunk, self.text);
+        add_handler!(handlers, DocumentEnd, self.end);
 
         handlers
     }
@@ -77,12 +78,13 @@ pub struct ExternElementContentHandlers {
 }
 
 impl ExternElementContentHandlers {
-    pub fn as_safe_element_content_handlers(&self) -> ElementContentHandlers {
+    #[must_use]
+    pub fn as_safe_element_content_handlers(&self) -> ElementContentHandlers<'_> {
         let mut handlers = ElementContentHandlers::default();
 
-        add_handler!(handlers, self.element);
-        add_handler!(handlers, self.comments);
-        add_handler!(handlers, self.text);
+        add_handler!(handlers, Element, self.element);
+        add_handler!(handlers, Comment, self.comments);
+        add_handler!(handlers, TextChunk, self.text);
 
         handlers
     }
@@ -100,7 +102,8 @@ pub struct HtmlRewriterBuilder {
 }
 
 impl HtmlRewriterBuilder {
-    pub fn get_safe_handlers(&self) -> SafeContentHandlers {
+    #[must_use]
+    pub fn get_safe_handlers(&self) -> SafeContentHandlers<'_> {
         SafeContentHandlers {
             document: self
                 .document_content_handlers
@@ -117,12 +120,12 @@ impl HtmlRewriterBuilder {
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_rewriter_builder_new() -> *mut HtmlRewriterBuilder {
+pub unsafe extern "C" fn lol_html_rewriter_builder_new() -> *mut HtmlRewriterBuilder {
     to_ptr_mut(HtmlRewriterBuilder::default())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_rewriter_builder_add_document_content_handlers(
+pub unsafe extern "C" fn lol_html_rewriter_builder_add_document_content_handlers(
     builder: *mut HtmlRewriterBuilder,
     doctype_handler: Option<DoctypeHandler>,
     doctype_handler_user_data: *mut c_void,
@@ -146,7 +149,7 @@ pub extern "C" fn lol_html_rewriter_builder_add_document_content_handlers(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_rewriter_builder_add_element_content_handlers(
+pub unsafe extern "C" fn lol_html_rewriter_builder_add_element_content_handlers(
     builder: *mut HtmlRewriterBuilder,
     selector: *const Selector,
     element_handler: Option<ElementHandler>,
@@ -171,6 +174,6 @@ pub extern "C" fn lol_html_rewriter_builder_add_element_content_handlers(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_rewriter_builder_free(builder: *mut HtmlRewriterBuilder) {
+pub unsafe extern "C" fn lol_html_rewriter_builder_free(builder: *mut HtmlRewriterBuilder) {
     drop(to_box!(builder));
 }

@@ -1,8 +1,8 @@
-pub trait Align {
+pub(crate) trait Align {
     fn align(&mut self, offset: usize);
 }
 
-impl<T: Align> Align for Vec<T> {
+impl<T: Align> Align for &mut [T] {
     #[inline]
     fn align(&mut self, offset: usize) {
         for item in self.iter_mut() {

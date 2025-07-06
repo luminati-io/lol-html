@@ -1,6 +1,5 @@
 use super::Range;
 use encoding_rs::{Encoding, WINDOWS_1252};
-use memchr::{memchr, memchr3};
 use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::ops::Deref;
@@ -8,24 +7,36 @@ use std::str;
 
 /// An error used to indicate that an encoded string has replacements and can't be converted losslessly.
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(unnameable_types, reason = "accidentally exposed via `tag.set_name()`")]
 pub struct HasReplacementsError;
+
+/// A thin wrapper around byte slice with handy APIs attached
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct Bytes<'b>(&'b [u8]);
 
 /// A thin wrapper around either byte slice or owned bytes with some handy APIs attached
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Bytes<'b>(Cow<'b, [u8]>);
+#[allow(unnameable_types, reason = "accidentally exposed via `tag.set_name()`")]
+#[repr(transparent)]
+pub struct BytesCow<'b>(Cow<'b, [u8]>);
 
-impl<'b> Bytes<'b> {
+impl<'b> BytesCow<'b> {
     #[inline]
     pub fn from_str(string: &'b str, encoding: &'static Encoding) -> Self {
         encoding.encode(string).0.into()
     }
 
-    /// Same as `Bytes::from_str(&string).into_owned()`, but avoids copying in the common case where
+    /// Same as `BytesCow::from_str(&string).into_owned()`, but avoids copying in the common case where
     /// the output and input encodings are the same.
-    pub fn from_string(string: String, encoding: &'static Encoding) -> Bytes<'static> {
-        Bytes(Cow::Owned(match encoding.encode(&string).0 {
+    pub fn from_string<'tmp>(
+        string: impl Into<Cow<'tmp, str>>,
+        encoding: &'static Encoding,
+    ) -> BytesCow<'static> {
+        let string = string.into();
+        BytesCow(Cow::Owned(match encoding.encode(string.as_ref()).0 {
             Cow::Owned(bytes) => bytes,
-            Cow::Borrowed(_) => string.into_bytes(),
+            Cow::Borrowed(_) => string.into_owned().into_bytes(),
         }))
     }
 
@@ -44,27 +55,58 @@ impl<'b> Bytes<'b> {
     }
 
     #[inline]
+    pub fn into_owned(self) -> BytesCow<'static> {
+        BytesCow(Cow::Owned(self.0.into_owned()))
+    }
+
+    #[inline]
+    pub(crate) fn as_ref(&self) -> Bytes<'_> {
+        Bytes(&self.0)
+    }
+
     pub fn as_string(&self, encoding: &'static Encoding) -> String {
-        encoding.decode(self).0.into_owned()
+        self.as_ref().as_string(encoding)
+    }
+
+    pub fn as_lowercase_string(&self, encoding: &'static Encoding) -> String {
+        self.as_ref().as_lowercase_string(encoding)
+    }
+}
+
+impl<'b> Bytes<'b> {
+    #[inline]
+    pub(crate) fn new(bytes: &'b [u8]) -> Self {
+        Self(bytes)
+    }
+
+    #[inline]
+    pub fn as_string(&self, encoding: &'static Encoding) -> String {
+        encoding.decode(self.0).0.into_owned()
     }
 
     #[inline]
     pub fn as_lowercase_string(&self, encoding: &'static Encoding) -> String {
-        encoding.decode(self).0.to_ascii_lowercase()
+        encoding.decode(self.0).0.to_ascii_lowercase()
     }
 
     #[inline]
-    pub fn into_owned(self) -> Bytes<'static> {
-        Bytes(Cow::Owned(self.0.into_owned()))
+    pub(crate) const fn as_slice(&self) -> &'b [u8] {
+        self.0
     }
 
     #[inline]
-    pub fn slice(&self, range: Range) -> Bytes {
-        self.0[range.start..range.end].into()
+    pub(crate) fn slice(&self, range: Range) -> Self {
+        Self(&self.0[range.start..range.end])
     }
 
     #[inline]
-    pub fn opt_slice(&self, range: Option<Range>) -> Option<Bytes> {
+    pub fn split_at(&self, pos: usize) -> (Self, Self) {
+        let (before, after) = self.0.split_at(pos);
+        (Self(before), Self(after))
+    }
+
+    #[inline]
+    pub(crate) fn opt_slice(&self, range: Option<Range>) -> Option<Self> {
         range.map(|range| self.slice(range))
     }
 
@@ -76,104 +118,64 @@ impl<'b> Bytes<'b> {
     }
 }
 
-macro_rules! impl_replace_byte {
-    ($self:tt, $output_handler:ident, $impls:ident) => {
-        let mut tail: &[u8] = $self;
-
-        loop {
-            match $impls!(@find tail) {
-                Some(pos) => {
-                    let replacement = $impls!(@get_replacement tail, pos);
-                    let chunk = &tail[..pos];
-
-                    if !chunk.is_empty() {
-                        $output_handler(chunk);
-                    }
-
-                    $output_handler(&replacement);
-                    tail = &tail[pos + 1..];
-                }
-                None => {
-                    if !tail.is_empty() {
-                        $output_handler(&tail);
-                    }
-                    break;
-                }
-            }
-        }
-    };
-}
-
-impl<'b> Bytes<'b> {
-    #[inline]
-    pub fn replace_byte(&self, (needle, repl): (u8, &[u8]), output_handler: &mut dyn FnMut(&[u8])) {
-        macro_rules! impls {
-            (@find $tail:ident) => {
-                memchr(needle, $tail)
-            };
-
-            (@get_replacement $tail:ident, $pos:ident) => {
-                repl
-            };
-        }
-
-        impl_replace_byte!(self, output_handler, impls);
-    }
-
-    #[inline]
-    pub fn replace_byte3(
-        &self,
-        (needle1, repl1): (u8, &[u8]),
-        (needle2, repl2): (u8, &[u8]),
-        (needle3, repl3): (u8, &[u8]),
-        output_handler: &mut dyn FnMut(&[u8]),
-    ) {
-        macro_rules! impls {
-            (@find $tail:ident) => {
-                memchr3(needle1, needle2, needle3, $tail)
-            };
-
-            (@get_replacement $tail:ident, $pos:ident) => {{
-                let matched = $tail[$pos];
-
-                if matched == needle1 {
-                    repl1
-                } else if matched == needle2 {
-                    repl2
-                } else {
-                    repl3
-                }
-            }};
-        }
-
-        impl_replace_byte!(self, output_handler, impls);
-    }
-}
-
-impl<'b> From<Cow<'b, [u8]>> for Bytes<'b> {
+impl<'b> From<Cow<'b, [u8]>> for BytesCow<'b> {
     #[inline]
     fn from(bytes: Cow<'b, [u8]>) -> Self {
-        Bytes(bytes)
+        Self(bytes)
     }
 }
 
-impl<'b> From<&'b [u8]> for Bytes<'b> {
+impl<'b> From<Bytes<'b>> for BytesCow<'b> {
+    #[inline]
+    fn from(bytes: Bytes<'b>) -> Self {
+        Self(Cow::Borrowed(bytes.0))
+    }
+}
+
+impl<'b> From<&'b [u8]> for BytesCow<'b> {
     #[inline]
     fn from(bytes: &'b [u8]) -> Self {
-        Bytes(bytes.into())
+        Self(bytes.into())
+    }
+}
+
+impl Debug for BytesCow<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl<'b> From<BytesCow<'b>> for Box<[u8]> {
+    #[inline]
+    fn from(bytes: BytesCow<'b>) -> Self {
+        match bytes.0 {
+            Cow::Owned(v) if v.len() == v.capacity() => v.into_boxed_slice(),
+            _ => Self::from(&bytes.0[..]),
+        }
     }
 }
 
 impl Debug for Bytes<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "`{}`", self.as_debug_string())
+    }
+}
+
+impl Deref for BytesCow<'_> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.0
     }
 }
 
 impl Deref for Bytes<'_> {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 }

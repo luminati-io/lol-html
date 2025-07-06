@@ -18,7 +18,7 @@ pub struct Input {
 
 impl From<String> for Input {
     fn from(input: String) -> Self {
-        Input {
+        Self {
             input,
             chunks: Vec::default(),
             initialized: false,
@@ -47,7 +47,7 @@ impl Input {
 
         // NOTE: Some encodings deviate from ASCII, e.g. in ShiftJIS yen sign (U+00A5) is
         // mapped to 0x5C which makes conversion from UTF8 to it non-roundtrippable despite the
-        // abscence of HTML entities replacements inserted by the encoder.
+        // absence of HTML entities replacements inserted by the encoder.
         if self.input != encoding.decode_without_bom_handling(&bytes).0 {
             return Err("ASCII characters deviation".into());
         }
@@ -72,7 +72,7 @@ impl Input {
         };
 
         if chunk_size > 0 {
-            self.chunks = bytes.chunks(chunk_size).map(|c| c.to_vec()).collect()
+            self.chunks = bytes.chunks(chunk_size).map(|c| c.to_vec()).collect();
         }
 
         Ok(chunk_size)
@@ -98,10 +98,10 @@ impl<'de> Deserialize<'de> for Input {
     {
         struct StringVisitor;
 
-        impl<'de> Visitor<'de> for StringVisitor {
+        impl Visitor<'_> for StringVisitor {
             type Value = Input;
 
-            fn expecting(&self, f: &mut Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
                 f.write_str("a string")
             }
 

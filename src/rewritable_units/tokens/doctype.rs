@@ -1,4 +1,7 @@
 use crate::base::Bytes;
+use crate::base::Spanned;
+use crate::errors::RewritingError;
+use crate::html_content::SourceLocation;
 use crate::rewritable_units::{Serialize, Token};
 use encoding_rs::Encoding;
 use std::any::Any;
@@ -25,7 +28,7 @@ use std::fmt::{self, Debug};
 ///                 Ok(())
 ///             })
 ///         ],
-///         ..RewriteStrSettings::default()
+///         ..RewriteStrSettings::new()
 ///     }
 /// ).unwrap();
 /// ```
@@ -37,19 +40,21 @@ pub struct Doctype<'i> {
     system_id: Option<Bytes<'i>>,
     force_quirks: bool,
     removed: bool,
-    raw: Bytes<'i>,
+    raw: Spanned<Bytes<'i>>,
     encoding: &'static Encoding,
     user_data: Box<dyn Any>,
 }
 
 impl<'i> Doctype<'i> {
+    #[inline]
+    #[must_use]
     pub(super) fn new_token(
         name: Option<Bytes<'i>>,
         public_id: Option<Bytes<'i>>,
         system_id: Option<Bytes<'i>>,
         force_quirks: bool,
         removed: bool,
-        raw: Bytes<'i>,
+        raw: Spanned<Bytes<'i>>,
         encoding: &'static Encoding,
     ) -> Token<'i> {
         Token::Doctype(Doctype {
@@ -66,6 +71,7 @@ impl<'i> Doctype<'i> {
 
     /// The name of the doctype.
     #[inline]
+    #[must_use]
     pub fn name(&self) -> Option<String> {
         self.name
             .as_ref()
@@ -74,54 +80,67 @@ impl<'i> Doctype<'i> {
 
     /// The public identifier of the doctype.
     #[inline]
+    #[must_use]
     pub fn public_id(&self) -> Option<String> {
         self.public_id.as_ref().map(|i| i.as_string(self.encoding))
     }
 
     /// The system identifier of the doctype.
     #[inline]
+    #[must_use]
     pub fn system_id(&self) -> Option<String> {
         self.system_id.as_ref().map(|i| i.as_string(self.encoding))
     }
 
     #[inline]
     #[cfg(feature = "integration_test")]
-    pub fn force_quirks(&self) -> bool {
+    #[must_use]
+    pub const fn force_quirks(&self) -> bool {
         self.force_quirks
     }
 
     /// Removes the doctype.
     #[inline]
     pub fn remove(&mut self) {
-        self.removed = true
+        self.removed = true;
     }
 
     /// Returns `true` if the doctype has been replaced or removed.
     #[inline]
+    #[must_use]
     pub fn removed(&self) -> bool {
         self.removed
+    }
+
+    /// Position of the doctype in the source document, before any rewriting
+    #[must_use]
+    pub fn source_location(&self) -> SourceLocation {
+        self.raw.source_location()
     }
 }
 
 impl_user_data!(Doctype<'_>);
 
-impl Serialize for Doctype<'_> {
+impl Serialize for &Doctype<'_> {
     #[inline]
-    fn to_bytes(&self, output_handler: &mut dyn FnMut(&[u8])) {
+    fn into_bytes(self, output_handler: &mut dyn FnMut(&[u8])) -> Result<(), RewritingError> {
         if !self.removed() {
-            output_handler(&self.raw);
+            output_handler(self.raw.as_slice());
         }
+        Ok(())
     }
 }
 
 impl Debug for Doctype<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Doctype")
             .field("name", &self.name())
             .field("public_id", &self.public_id())
             .field("system_id", &self.system_id())
             .field("force_quirks", &self.force_quirks)
             .field("removed", &self.removed)
+            .field("at", &self.source_location())
             .finish()
     }
 }
@@ -136,7 +155,7 @@ mod tests {
     fn rewrite_doctype(
         html: &[u8],
         encoding: &'static Encoding,
-        mut handler: impl FnMut(&mut Doctype),
+        mut handler: impl FnMut(&mut Doctype<'_>),
     ) -> String {
         let mut handler_called = false;
 

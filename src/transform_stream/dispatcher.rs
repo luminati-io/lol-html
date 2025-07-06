@@ -1,40 +1,47 @@
-use super::*;
-use crate::base::{Bytes, Range, SharedEncoding};
+use crate::base::{Bytes, Range, SharedEncoding, SourceLocation};
 use crate::html::{LocalName, Namespace};
+use crate::html_content::{TextChunk, TextType};
 use crate::parser::{
-    Lexeme, LexemeSink, NonTagContentLexeme, ParserDirective, ParserOutputSink, TagHintSink,
-    TagLexeme, TagTokenOutline,
+    AttributeBuffer, Lexeme, LexemeSink, NonTagContentLexeme, NonTagContentTokenOutline,
+    ParserDirective, ParserOutputSink, TagHintSink, TagLexeme, TagTokenOutline,
 };
-use crate::rewritable_units::{
-    DocumentEnd, Serialize, ToToken, Token, TokenCaptureFlags, TokenCapturer, TokenCapturerEvent,
-};
+use crate::rewritable_units::TextDecoder;
+use crate::rewritable_units::ToTokenResult;
+use crate::rewritable_units::{DocumentEnd, Serialize, ToToken, Token, TokenCaptureFlags};
 use crate::rewriter::RewritingError;
-use std::rc::Rc;
+use encoding_rs::Encoding;
 
-use TagTokenOutline::*;
-
-pub struct AuxStartTagInfo<'i> {
+pub(crate) struct AuxStartTagInfo<'i> {
     pub input: &'i Bytes<'i>,
-    pub attr_buffer: SharedAttributeBuffer,
+    pub attr_buffer: &'i AttributeBuffer,
     pub self_closing: bool,
 }
 
-type AuxStartTagInfoRequest<C> =
-    Box<dyn FnOnce(&mut C, AuxStartTagInfo<'_>) -> Result<TokenCaptureFlags, RewritingError>>;
+type AuxStartTagInfoRequest<C> = Box<
+    dyn FnOnce(&mut C, AuxStartTagInfo<'_>) -> Result<TokenCaptureFlags, RewritingError> + Send,
+>;
 
+// Pub only for integration tests
+#[allow(private_interfaces)]
 pub enum DispatcherError<C> {
     InfoRequest(AuxStartTagInfoRequest<C>),
     RewritingError(RewritingError),
 }
 
+// Pub only for integration tests
 pub type StartTagHandlingResult<C> = Result<TokenCaptureFlags, DispatcherError<C>>;
 
+// Pub only for integration tests
 pub trait TransformController: Sized {
     fn initial_capture_flags(&self) -> TokenCaptureFlags;
-    fn handle_start_tag(&mut self, name: LocalName, ns: Namespace) -> StartTagHandlingResult<Self>;
-    fn handle_end_tag(&mut self, name: LocalName) -> TokenCaptureFlags;
-    fn handle_token(&mut self, token: &mut Token) -> Result<(), RewritingError>;
-    fn handle_end(&mut self, document_end: &mut DocumentEnd) -> Result<(), RewritingError>;
+    fn handle_start_tag(
+        &mut self,
+        name: LocalName<'_>,
+        ns: Namespace,
+    ) -> StartTagHandlingResult<Self>;
+    fn handle_end_tag(&mut self, name: LocalName<'_>) -> TokenCaptureFlags;
+    fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError>;
+    fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> Result<(), RewritingError>;
     fn should_emit_content(&self) -> bool;
 }
 
@@ -59,58 +66,48 @@ impl<F: FnMut(&[u8])> OutputSink for F {
     }
 }
 
-pub struct Dispatcher<C, O>
-where
-    C: TransformController,
-    O: OutputSink,
-{
-    transform_controller: C,
-    output_sink: O,
-    remaining_content_start: usize,
-    token_capturer: TokenCapturer,
+// Pub only for integration tests
+pub struct Dispatcher<C, O> {
+    delegate: DispatcherDelegate<C, O>,
+    text_decoder: TextDecoder,
+    last_text_type: TextType,
     got_flags_from_hint: bool,
     pending_element_aux_info_req: Option<AuxStartTagInfoRequest<C>>,
-    emission_enabled: bool,
     encoding: SharedEncoding,
 }
 
-impl<C, O> Dispatcher<C, O>
+/// Fields split out of `Dispatcher` for borrow checking of event handlers
+struct DispatcherDelegate<C, O> {
+    transform_controller: C,
+    output_sink: O,
+    remaining_content_start: usize,
+    capture_flags: TokenCaptureFlags,
+    emission_enabled: bool,
+}
+
+impl<C, O> DispatcherDelegate<C, O>
 where
     C: TransformController,
     O: OutputSink,
 {
-    pub fn new(transform_controller: C, output_sink: O, encoding: SharedEncoding) -> Self {
-        let initial_capture_flags = transform_controller.initial_capture_flags();
+    fn flush_remaining_input(&mut self, input: &[u8], consumed_byte_count: usize) {
+        if self.emission_enabled {
+            let output = input
+                .get(self.remaining_content_start..consumed_byte_count)
+                .unwrap_or_default();
 
-        Dispatcher {
-            transform_controller,
-            output_sink,
-            remaining_content_start: 0,
-            token_capturer: TokenCapturer::new(
-                initial_capture_flags,
-                SharedEncoding::clone(&encoding),
-            ),
-            got_flags_from_hint: false,
-            pending_element_aux_info_req: None,
-            emission_enabled: true,
-            encoding,
-        }
-    }
-
-    pub fn flush_remaining_input(&mut self, input: &[u8], consumed_byte_count: usize) {
-        let output = &input[self.remaining_content_start..consumed_byte_count];
-
-        if self.emission_enabled && !output.is_empty() {
-            self.output_sink.handle_chunk(output);
+            if !output.is_empty() {
+                self.output_sink.handle_chunk(output);
+            }
         }
 
         self.remaining_content_start = 0;
     }
 
-    pub fn finish(&mut self, input: &[u8]) -> Result<(), RewritingError> {
+    fn finish(&mut self, encoding: &'static Encoding, input: &[u8]) -> Result<(), RewritingError> {
         self.flush_remaining_input(input, input.len());
 
-        let mut document_end = DocumentEnd::new(&mut self.output_sink, self.encoding.get());
+        let mut document_end = DocumentEnd::new(&mut self.output_sink, encoding);
 
         self.transform_controller.handle_end(&mut document_end)?;
 
@@ -120,6 +117,92 @@ where
         Ok(())
     }
 
+    fn lexeme_consumed<T>(&mut self, lexeme: &Lexeme<'_, T>) {
+        let lexeme_range = lexeme.raw_range();
+
+        let chunk_range = Range {
+            start: self.remaining_content_start,
+            end: lexeme_range.start,
+        };
+
+        let chunk = lexeme.input().slice(chunk_range);
+
+        if self.emission_enabled && !chunk.is_empty() {
+            self.output_sink.handle_chunk(&chunk);
+        }
+
+        self.remaining_content_start = lexeme_range.end;
+    }
+
+    #[inline]
+    fn token_produced(&mut self, mut token: Token<'_>) -> Result<(), RewritingError> {
+        trace!(@output token);
+
+        self.transform_controller.handle_token(&mut token)?;
+
+        if self.emission_enabled {
+            token.into_bytes(&mut |c| self.output_sink.handle_chunk(c))?;
+        }
+        Ok(())
+    }
+
+    fn text_token_produced(
+        &mut self,
+        text: &str,
+        encoding: &'static Encoding,
+        text_type: TextType,
+        is_last_in_node: bool,
+        source_location: SourceLocation,
+    ) -> Result<(), RewritingError> {
+        let mut token = Token::TextChunk(TextChunk::new(
+            text,
+            text_type,
+            is_last_in_node,
+            encoding,
+            source_location,
+        ));
+
+        trace!(@output token);
+
+        self.transform_controller.handle_token(&mut token)?;
+
+        if self.emission_enabled {
+            token.into_bytes(&mut |c| self.output_sink.handle_chunk(c))?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn should_stop_removing_element_content(&self) -> bool {
+        !self.emission_enabled && self.transform_controller.should_emit_content()
+    }
+}
+
+impl<C, O> Dispatcher<C, O>
+where
+    C: TransformController,
+    O: OutputSink,
+{
+    pub fn new(transform_controller: C, output_sink: O, encoding: SharedEncoding) -> Self {
+        let capture_flags = transform_controller.initial_capture_flags();
+
+        Self {
+            delegate: DispatcherDelegate {
+                transform_controller,
+                output_sink,
+                capture_flags,
+                remaining_content_start: 0,
+                emission_enabled: true,
+            },
+            text_decoder: TextDecoder::new(SharedEncoding::clone(&encoding)),
+            last_text_type: TextType::Data,
+            encoding,
+            got_flags_from_hint: false,
+            pending_element_aux_info_req: None,
+        }
+    }
+
+    #[inline(never)]
     fn try_produce_token_from_lexeme<'i, T>(
         &mut self,
         lexeme: &Lexeme<'i, T>,
@@ -127,50 +210,36 @@ where
     where
         Lexeme<'i, T>: ToToken,
     {
-        let transform_controller = &mut self.transform_controller;
-        let output_sink = &mut self.output_sink;
-        let emission_enabled = self.emission_enabled;
-        let lexeme_range = lexeme.raw_range();
-        let remaining_content_start = self.remaining_content_start;
-        let mut lexeme_consumed = false;
-
-        self.token_capturer.feed(lexeme, |event| {
-            match event {
-                TokenCapturerEvent::LexemeConsumed => {
-                    let chunk = lexeme.input().slice(Range {
-                        start: remaining_content_start,
-                        end: lexeme_range.start,
-                    });
-
-                    lexeme_consumed = true;
-
-                    if emission_enabled && chunk.len() > 0 {
-                        output_sink.handle_chunk(&chunk);
-                    }
-                }
-                TokenCapturerEvent::TokenProduced(mut token) => {
-                    trace!(@output token);
-
-                    transform_controller.handle_token(&mut token)?;
-
-                    if emission_enabled {
-                        token.to_bytes(&mut |c| output_sink.handle_chunk(c));
-                    }
-                }
+        match lexeme.to_token(&mut self.delegate.capture_flags, self.encoding.get()) {
+            ToTokenResult::Token(token) => {
+                self.delegate.lexeme_consumed(lexeme);
+                self.delegate.token_produced(token)?;
             }
-            Ok(())
-        })?;
-
-        if lexeme_consumed {
-            self.remaining_content_start = lexeme_range.end;
+            ToTokenResult::Text(text_type) => {
+                self.delegate.lexeme_consumed(lexeme);
+                self.last_text_type = text_type;
+                self.text_decoder.feed_text(
+                    lexeme.spanned(),
+                    false,
+                    &mut |text, is_last, encoding, source_location| {
+                        self.delegate.text_token_produced(
+                            text,
+                            encoding,
+                            self.last_text_type,
+                            is_last,
+                            source_location,
+                        )
+                    },
+                )?;
+            }
+            ToTokenResult::None => {}
         }
-
         Ok(())
     }
 
     #[inline]
-    fn get_next_parser_directive(&self) -> ParserDirective {
-        if self.token_capturer.has_captures() {
+    const fn get_next_parser_directive(&self) -> ParserDirective {
+        if !self.delegate.capture_flags.is_empty() {
             ParserDirective::Lex
         } else {
             ParserDirective::WherePossibleScanForTagsOnly
@@ -179,17 +248,17 @@ where
 
     fn adjust_capture_flags_for_tag_lexeme(
         &mut self,
-        lexeme: &TagLexeme,
+        lexeme: &TagLexeme<'_>,
     ) -> Result<(), RewritingError> {
         let input = lexeme.input();
 
         macro_rules! get_flags_from_aux_info_res {
             ($handler:expr, $attributes:expr, $self_closing:expr) => {
                 $handler(
-                    &mut self.transform_controller,
+                    &mut self.delegate.transform_controller,
                     AuxStartTagInfo {
                         input,
-                        attr_buffer: Rc::clone($attributes),
+                        attr_buffer: $attributes,
                         self_closing: $self_closing,
                     },
                 )
@@ -200,18 +269,20 @@ where
             // NOTE: tag hint was produced for the tag, but
             // attributes and self closing flag were requested.
             Some(aux_info_req) => match *lexeme.token_outline() {
-                StartTag {
+                TagTokenOutline::StartTag {
                     ref attributes,
                     self_closing,
                     ..
-                } => get_flags_from_aux_info_res!(aux_info_req, attributes, self_closing),
+                } => {
+                    get_flags_from_aux_info_res!(aux_info_req, &attributes, self_closing)
+                }
                 _ => unreachable!("Tag should be a start tag at this point"),
             },
 
             // NOTE: tag hint hasn't been produced for the tag, because
             // parser is not in the tag scan mode.
             None => match *lexeme.token_outline() {
-                StartTag {
+                TagTokenOutline::StartTag {
                     name,
                     name_hash,
                     ns,
@@ -220,25 +291,29 @@ where
                 } => {
                     let name = LocalName::new(input, name, name_hash);
 
-                    match self.transform_controller.handle_start_tag(name, ns) {
+                    match self
+                        .delegate
+                        .transform_controller
+                        .handle_start_tag(name, ns)
+                    {
                         Ok(flags) => Ok(flags),
                         Err(DispatcherError::InfoRequest(aux_info_req)) => {
-                            get_flags_from_aux_info_res!(aux_info_req, attributes, self_closing)
+                            get_flags_from_aux_info_res!(aux_info_req, &attributes, self_closing)
                         }
                         Err(DispatcherError::RewritingError(e)) => Err(e),
                     }
                 }
 
-                EndTag { name, name_hash } => {
+                TagTokenOutline::EndTag { name, name_hash } => {
                     let name = LocalName::new(input, name, name_hash);
-                    Ok(self.transform_controller.handle_end_tag(name))
+                    Ok(self.delegate.transform_controller.handle_end_tag(name))
                 }
             },
         };
 
         match capture_flags {
             Ok(flags) => {
-                self.token_capturer.set_capture_flags(flags);
+                self.delegate.capture_flags = flags;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -250,37 +325,33 @@ where
         &mut self,
         flags: TokenCaptureFlags,
     ) -> ParserDirective {
-        self.token_capturer.set_capture_flags(flags);
+        self.delegate.capture_flags = flags;
         self.got_flags_from_hint = true;
         self.get_next_parser_directive()
     }
 
+    /// Emit text chunk with is_last_in_node
     #[inline]
     fn flush_pending_captured_text(&mut self) -> Result<(), RewritingError> {
-        let transform_controller = &mut self.transform_controller;
-        let output_sink = &mut self.output_sink;
-        let emission_enabled = self.emission_enabled;
-
-        self.token_capturer.flush_pending_text(&mut |event| {
-            if let TokenCapturerEvent::TokenProduced(mut token) = event {
-                trace!(@output token);
-
-                transform_controller.handle_token(&mut token)?;
-
-                if emission_enabled {
-                    token.to_bytes(&mut |c| output_sink.handle_chunk(c));
-                }
-            }
-
-            Ok(())
-        })?;
-
-        Ok(())
+        self.text_decoder
+            .flush_pending(&mut |text, is_last, encoding, source_location| {
+                self.delegate.text_token_produced(
+                    text,
+                    encoding,
+                    self.last_text_type,
+                    is_last,
+                    source_location,
+                )
+            })
     }
 
-    #[inline]
-    fn should_stop_removing_element_content(&self) -> bool {
-        !self.emission_enabled && self.transform_controller.should_emit_content()
+    pub fn flush_remaining_input(&mut self, input: &[u8], consumed_byte_count: usize) {
+        self.delegate
+            .flush_remaining_input(input, consumed_byte_count);
+    }
+
+    pub fn finish(&mut self, input: &[u8]) -> Result<(), RewritingError> {
+        self.delegate.finish(self.encoding.get(), input)
     }
 }
 
@@ -289,7 +360,7 @@ where
     C: TransformController,
     O: OutputSink,
 {
-    fn handle_tag(&mut self, lexeme: &TagLexeme) -> Result<ParserDirective, RewritingError> {
+    fn handle_tag(&mut self, lexeme: &TagLexeme<'_>) -> Result<ParserDirective, RewritingError> {
         // NOTE: flush pending text before reporting tag to the transform controller.
         // Otherwise, transform controller can enable or disable text handlers too early.
         // In case of start tag, newly matched element text handlers
@@ -304,14 +375,14 @@ where
         }
 
         if let TagTokenOutline::EndTag { .. } = lexeme.token_outline() {
-            if self.should_stop_removing_element_content() {
-                self.emission_enabled = true;
-                self.remaining_content_start = lexeme.raw_range().start;
+            if self.delegate.should_stop_removing_element_content() {
+                self.delegate.emission_enabled = true;
+                self.delegate.remaining_content_start = lexeme.raw_range().start;
             }
         }
 
         self.try_produce_token_from_lexeme(lexeme)?;
-        self.emission_enabled = self.transform_controller.should_emit_content();
+        self.delegate.emission_enabled = self.delegate.transform_controller.should_emit_content();
 
         Ok(self.get_next_parser_directive())
     }
@@ -319,8 +390,13 @@ where
     #[inline]
     fn handle_non_tag_content(
         &mut self,
-        lexeme: &NonTagContentLexeme,
+        lexeme: &NonTagContentLexeme<'_>,
     ) -> Result<(), RewritingError> {
+        match lexeme.token_outline() {
+            Some(NonTagContentTokenOutline::Text(_)) => {}
+            // when it's None, it still needs a flush for CDATA
+            _ => self.flush_pending_captured_text()?,
+        }
         self.try_produce_token_from_lexeme(lexeme)
     }
 }
@@ -332,10 +408,14 @@ where
 {
     fn handle_start_tag_hint(
         &mut self,
-        name: LocalName,
+        name: LocalName<'_>,
         ns: Namespace,
     ) -> Result<ParserDirective, RewritingError> {
-        match self.transform_controller.handle_start_tag(name, ns) {
+        match self
+            .delegate
+            .transform_controller
+            .handle_start_tag(name, ns)
+        {
             Ok(flags) => {
                 Ok(self.apply_capture_flags_from_hint_and_get_next_parser_directive(flags))
             }
@@ -349,16 +429,19 @@ where
         }
     }
 
-    fn handle_end_tag_hint(&mut self, name: LocalName) -> Result<ParserDirective, RewritingError> {
+    fn handle_end_tag_hint(
+        &mut self,
+        name: LocalName<'_>,
+    ) -> Result<ParserDirective, RewritingError> {
         self.flush_pending_captured_text()?;
 
-        let mut flags = self.transform_controller.handle_end_tag(name);
+        let mut flags = self.delegate.transform_controller.handle_end_tag(name);
 
         // NOTE: if emission was disabled (i.e. we've been removing element content)
         // we need to request the end tag lexeme, to ensure that we have it.
         // Otherwise, if we have unfinished end tag in the end of input we'll emit
         // it where we shouldn't.
-        if self.should_stop_removing_element_content() {
+        if self.delegate.should_stop_removing_element_content() {
             flags |= TokenCaptureFlags::NEXT_END_TAG;
         }
 

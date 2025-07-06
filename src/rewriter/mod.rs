@@ -2,51 +2,44 @@ mod handlers_dispatcher;
 mod rewrite_controller;
 
 #[macro_use]
-mod settings;
+pub(crate) mod settings;
 
-use self::handlers_dispatcher::ContentHandlersDispatcher;
-use self::rewrite_controller::*;
+use self::rewrite_controller::{ElementDescriptor, HtmlRewriteController};
+pub use self::settings::*;
 use crate::base::SharedEncoding;
-use crate::memory::MemoryLimitExceededError;
-use crate::memory::MemoryLimiter;
+use crate::memory::{MemoryLimitExceededError, SharedMemoryLimiter};
 use crate::parser::ParsingAmbiguityError;
-use crate::selectors_vm::{self, SelectorMatchingVm};
+use crate::rewritable_units::Element;
 use crate::transform_stream::*;
 use encoding_rs::Encoding;
 use mime::Mime;
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug};
-use std::rc::Rc;
 use thiserror::Error;
-
-pub use self::settings::*;
 
 /// This is an encoding known to be ASCII-compatible.
 ///
 /// Non-ASCII-compatible encodings (`UTF-16LE`, `UTF-16BE`, `ISO-2022-JP` and
-/// `replacement`) are not supported by lol_html.
+/// `replacement`) are not supported by `lol_html`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AsciiCompatibleEncoding(&'static Encoding);
 
 impl AsciiCompatibleEncoding {
     /// Returns `Some` if `Encoding` is ascii-compatible, or `None` otherwise.
+    #[must_use]
     pub fn new(encoding: &'static Encoding) -> Option<Self> {
-        if encoding.is_ascii_compatible() {
-            Some(Self(encoding))
-        } else {
-            None
-        }
+        encoding.is_ascii_compatible().then_some(Self(encoding))
     }
 
-    fn from_mimetype(mime: &Mime) -> Option<AsciiCompatibleEncoding> {
-        mime.get_param("charset")
-            .and_then(|cs| Encoding::for_label_no_replacement(cs.as_str().as_bytes()))
-            .and_then(AsciiCompatibleEncoding::new)
+    fn from_mimetype(mime: &Mime) -> Option<Self> {
+        let cs = mime.get_param("charset")?;
+        Self::new(Encoding::for_label_no_replacement(cs.as_str().as_bytes())?)
     }
 
     /// Returns the most commonly used UTF-8 encoding.
-    pub fn utf_8() -> AsciiCompatibleEncoding {
+    #[must_use]
+    pub fn utf_8() -> Self {
         Self(encoding_rs::UTF_8)
     }
 }
@@ -57,7 +50,7 @@ impl From<AsciiCompatibleEncoding> for &'static Encoding {
     }
 }
 
-impl std::convert::TryFrom<&'static Encoding> for AsciiCompatibleEncoding {
+impl TryFrom<&'static Encoding> for AsciiCompatibleEncoding {
     type Error = ();
 
     fn try_from(enc: &'static Encoding) -> Result<Self, ()> {
@@ -116,7 +109,7 @@ pub enum RewritingError {
 ///                     Ok(())
 ///                 })
 ///             ],
-///             ..Settings::default()
+///             ..Settings::new()
 ///         },
 ///         |c: &[u8]| output.extend_from_slice(c)
 ///     );
@@ -132,8 +125,8 @@ pub enum RewritingError {
 ///     r#"<div><a href="https://example.com"></a></div>"#
 /// );
 /// ```
-pub struct HtmlRewriter<'h, O: OutputSink> {
-    stream: TransformStream<HtmlRewriteController<'h>, O>,
+pub struct HtmlRewriter<'h, O: OutputSink, H: HandlerTypes = LocalHandlerTypes> {
+    stream: TransformStream<HtmlRewriteController<'h, H>, O>,
     poisoned: bool,
 }
 
@@ -154,7 +147,7 @@ macro_rules! guarded {
     }};
 }
 
-impl<'h, O: OutputSink> HtmlRewriter<'h, O> {
+impl<'h, O: OutputSink, H: HandlerTypes> HtmlRewriter<'h, O, H> {
     /// Constructs a new rewriter with the provided `settings` that writes
     /// the output to the `output_sink`.
     ///
@@ -163,59 +156,27 @@ impl<'h, O: OutputSink> HtmlRewriter<'h, O> {
     /// For the convenience the [`OutputSink`] trait is implemented for closures.
     ///
     /// [`OutputSink`]: trait.OutputSink.html
-    pub fn new<'s>(settings: Settings<'h, 's>, output_sink: O) -> Self {
+    pub fn new<'s>(settings: Settings<'h, 's, H>, output_sink: O) -> Self {
+        let preallocated_parsing_buffer_size =
+            settings.memory_settings.preallocated_parsing_buffer_size;
+        let strict = settings.strict;
+
         let encoding = SharedEncoding::new(settings.encoding);
-        let mut selectors_ast = selectors_vm::Ast::default();
-        let mut dispatcher = ContentHandlersDispatcher::default();
-        let has_selectors =
-            !settings.element_content_handlers.is_empty() || settings.adjust_charset_on_meta_tag;
-
-        let charset_adjust_handler = if settings.adjust_charset_on_meta_tag {
-            let encoding = SharedEncoding::clone(&encoding);
-            Some(handler_adjust_charset_on_meta_tag(encoding))
-        } else {
-            None
-        };
-
-        let element_content_handlers = charset_adjust_handler
-            .into_iter()
-            .chain(settings.element_content_handlers);
-
-        for (selector, handlers) in element_content_handlers {
-            let locator = dispatcher.add_selector_associated_handlers(handlers);
-
-            selectors_ast.add_selector(&selector, locator);
-        }
-
-        for handlers in settings.document_content_handlers {
-            dispatcher.add_document_content_handlers(handlers);
-        }
 
         let memory_limiter =
-            MemoryLimiter::new_shared(settings.memory_settings.max_allowed_memory_usage);
-
-        let selector_matching_vm = if has_selectors {
-            Some(SelectorMatchingVm::new(
-                selectors_ast,
-                settings.encoding.into(),
-                Rc::clone(&memory_limiter),
-                settings.enable_esi_tags,
-            ))
-        } else {
-            None
-        };
-
-        let controller = HtmlRewriteController::new(dispatcher, selector_matching_vm);
+            SharedMemoryLimiter::new(settings.memory_settings.max_allowed_memory_usage);
 
         let stream = TransformStream::new(TransformStreamSettings {
-            transform_controller: controller,
+            transform_controller: HtmlRewriteController::from_settings(
+                settings,
+                &memory_limiter,
+                &encoding,
+            ),
             output_sink,
-            preallocated_parsing_buffer_size: settings
-                .memory_settings
-                .preallocated_parsing_buffer_size,
+            preallocated_parsing_buffer_size,
             memory_limiter,
             encoding,
-            strict: settings.strict,
+            strict,
         });
 
         HtmlRewriter {
@@ -256,38 +217,53 @@ impl<'h, O: OutputSink> HtmlRewriter<'h, O> {
 // NOTE: this opaque Debug implementation is required to make
 // `.unwrap()` and `.expect()` methods available on Result
 // returned by the `HtmlRewriterBuilder.build()` method.
-impl<O: OutputSink> Debug for HtmlRewriter<'_, O> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl<O: OutputSink, H: HandlerTypes> Debug for HtmlRewriter<'_, O, H> {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HtmlRewriter")
     }
 }
 
-fn handler_adjust_charset_on_meta_tag(
+fn handler_adjust_charset_on_meta_tag<'h, H: HandlerTypes>(
     encoding: SharedEncoding,
-) -> (
-    Cow<'static, crate::Selector>,
-    ElementContentHandlers<'static>,
-) {
-    element!("meta", move |el| {
-        let attr_charset = el
-            .get_attribute("charset")
-            .and_then(|cs| Encoding::for_label_no_replacement(cs.as_bytes()))
-            .and_then(AsciiCompatibleEncoding::new);
+) -> (Cow<'h, crate::Selector>, ElementContentHandlers<'h, H>) {
+    // HTML5 allows encoding to be set only once
+    let mut found = false;
 
-        let attr_http_equiv = el
-            .get_attribute("http-equiv")
-            .filter(|http_equiv| http_equiv.eq_ignore_ascii_case("Content-Type"))
-            .and_then(|_| el.get_attribute("content"))
-            .and_then(|ct| ct.parse::<Mime>().ok())
-            .as_ref()
-            .and_then(AsciiCompatibleEncoding::from_mimetype);
+    let handler = move |el: &mut Element<'_, '_, H>| {
+        if found {
+            return Ok(());
+        }
 
-        if let Some(charset) = attr_charset.or(attr_http_equiv) {
-            encoding.set(charset)
+        let charset = el.get_attribute("charset").and_then(|cs| {
+            AsciiCompatibleEncoding::new(Encoding::for_label_no_replacement(cs.as_bytes())?)
+        });
+
+        let charset = charset.or_else(|| {
+            el.get_attribute("http-equiv")
+                .filter(|http_equiv| http_equiv.eq_ignore_ascii_case("Content-Type"))
+                .and_then(|_| {
+                    AsciiCompatibleEncoding::from_mimetype(
+                        &el.get_attribute("content")?.parse::<Mime>().ok()?,
+                    )
+                })
+        });
+
+        if let Some(charset) = charset {
+            found = true;
+            encoding.set(charset);
         }
 
         Ok(())
-    })
+    };
+
+    let content_handlers = ElementContentHandlers {
+        element: Some(H::new_element_handler(handler)),
+        comments: None,
+        text: None,
+    };
+
+    (Cow::Owned("meta".parse().unwrap()), content_handlers)
 }
 
 /// Rewrites given `html` string with the provided `settings`.
@@ -314,15 +290,15 @@ fn handler_adjust_charset_on_meta_tag(
 ///     r#"<div><a href="http://example.com"></a></div>"#,
 ///     RewriteStrSettings {
 ///         element_content_handlers,
-///         ..RewriteStrSettings::default()
+///         ..RewriteStrSettings::new()
 ///     }
 /// ).unwrap();
 ///
 /// assert_eq!(output, r#"<div><a href="https://example.com"></a></div>"#);
 /// ```
-pub fn rewrite_str<'h, 's>(
+pub fn rewrite_str<'h, 's, H: HandlerTypes>(
     html: &str,
-    settings: impl Into<Settings<'h, 's>>,
+    settings: impl Into<Settings<'h, 's, H>>,
 ) -> Result<String, RewritingError> {
     let mut output = vec![];
 
@@ -340,16 +316,21 @@ pub fn rewrite_str<'h, 's>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::html::TextType;
     use crate::html_content::ContentType;
     use crate::test_utils::{Output, ASCII_COMPATIBLE_ENCODINGS, NON_ASCII_COMPATIBLE_ENCODINGS};
     use encoding_rs::Encoding;
     use itertools::Itertools;
-    use std::cell::RefCell;
+    use static_assertions::assert_impl_all;
     use std::convert::TryInto;
-    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // Assert that HtmlRewriter with `SendHandlerTypes` is `Send`.
+    assert_impl_all!(crate::send::HtmlRewriter<'_, Box<dyn FnMut(&[u8]) + Send>>: Send);
 
     fn write_chunks<O: OutputSink>(
-        mut rewriter: HtmlRewriter<O>,
+        mut rewriter: HtmlRewriter<'_, O>,
         encoding: &'static Encoding,
         chunks: &[&str],
     ) {
@@ -362,7 +343,7 @@ mod tests {
         rewriter.end().unwrap();
     }
 
-    fn rewrite_html_bytes(html: &[u8], settings: Settings) -> Vec<u8> {
+    fn rewrite_html_bytes(html: &[u8], settings: Settings<'_, '_>) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(html.len());
 
         let mut rewriter = HtmlRewriter::new(settings, |c: &[u8]| out.extend_from_slice(c));
@@ -373,9 +354,45 @@ mod tests {
         out
     }
 
+    #[allow(clippy::drop_non_drop)]
+    #[test]
+    fn handlers_lifetime_covariance() {
+        // This test checks that if you have a handler with a lifetime larger than `'a` then you can
+        // use it in a place where a handler of lifetime `'a` is expected. If the code below
+        // compiles, then this condition holds.
+
+        let x = AtomicUsize::new(0);
+
+        let el_handler_static = element!("foo", |_| Ok(()));
+        let el_handler_local = element!("foo", |_| {
+            x.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        let doc_handler_static = end!(|_| Ok(()));
+        let doc_handler_local = end!(|_| {
+            x.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        let settings = Settings {
+            document_content_handlers: vec![doc_handler_static, doc_handler_local],
+            element_content_handlers: vec![el_handler_static, el_handler_local],
+            encoding: AsciiCompatibleEncoding::utf_8(),
+            strict: false,
+            adjust_charset_on_meta_tag: false,
+            ..Settings::new()
+        };
+        let rewriter = HtmlRewriter::new(settings, |_: &[u8]| ());
+
+        drop(rewriter);
+
+        drop(x);
+    }
+
     #[test]
     fn rewrite_html_str() {
-        let res = rewrite_str(
+        let res = rewrite_str::<LocalHandlerTypes>(
             "<!-- 42 --><div><!--hi--></div>",
             RewriteStrSettings {
                 element_content_handlers: vec![
@@ -388,7 +405,7 @@ mod tests {
                         Ok(())
                     }),
                 ],
-                ..RewriteStrSettings::default()
+                ..RewriteStrSettings::new()
             },
         )
         .unwrap();
@@ -397,8 +414,32 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_incorrect_self_closing() {
+        let res = rewrite_str::<LocalHandlerTypes>(
+            "<title /></title><div/></div><style /></style><script /></script>
+            <br/><br><embed/><embed> <svg><a/><path/><path></path></svg>",
+            RewriteStrSettings {
+                element_content_handlers: vec![element!("*:not(svg)", |el| {
+                    el.set_attribute("s", if el.is_self_closing() { "y" } else { "n" })?;
+                    el.set_attribute("c", if el.can_have_content() { "y" } else { "n" })?;
+                    el.append("…", ContentType::Text);
+                    Ok(())
+                })],
+                ..RewriteStrSettings::new()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            res,
+            r#"<title s="y" c="y">…</title><div s="y" c="y">…</div><style s="y" c="y">…</style><script s="y" c="y">…</script>
+            <br s="y" c="n" /><br s="n" c="n"><embed s="y" c="n" /><embed s="n" c="n"> <svg><a s="y" c="n" /><path s="y" c="n" /><path s="n" c="y">…</path></svg>"#
+        );
+    }
+
+    #[test]
     fn rewrite_arbitrary_settings() {
-        let res = rewrite_str("<span>Some text</span>", Settings::default()).unwrap();
+        let res = rewrite_str("<span>Some text</span>", Settings::new()).unwrap();
         assert_eq!(res, "<span>Some text</span>");
     }
 
@@ -411,7 +452,7 @@ mod tests {
 
     #[test]
     fn doctype_info() {
-        for &enc in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for &enc in &ASCII_COMPATIBLE_ENCODINGS {
             let mut doctypes = Vec::default();
 
             {
@@ -423,7 +464,7 @@ mod tests {
                         })],
                         // NOTE: unwrap() here is intentional; it also tests `Ascii::new`.
                         encoding: enc.try_into().unwrap(),
-                        ..Settings::default()
+                        ..Settings::new()
                     },
                     |_: &[u8]| {},
                 );
@@ -458,7 +499,7 @@ mod tests {
 
     #[test]
     fn rewrite_start_tags() {
-        for &enc in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for &enc in &ASCII_COMPATIBLE_ENCODINGS {
             let actual: String = {
                 let mut output = Output::new(enc);
 
@@ -470,7 +511,7 @@ mod tests {
                             Ok(())
                         })],
                         encoding: enc.try_into().unwrap(),
-                        ..Settings::default()
+                        ..Settings::new()
                     },
                     |c: &[u8]| output.push(c),
                 );
@@ -509,7 +550,7 @@ mod tests {
 
     #[test]
     fn rewrite_document_content() {
-        for &enc in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for &enc in &ASCII_COMPATIBLE_ENCODINGS {
             let actual: String = {
                 let mut output = Output::new(enc);
 
@@ -530,7 +571,7 @@ mod tests {
                             }),
                         ],
                         encoding: enc.try_into().unwrap(),
-                        ..Settings::default()
+                        ..Settings::new()
                     },
                     |c: &[u8]| output.push(c),
                 );
@@ -572,16 +613,88 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_text_types() {
+        for &enc in &ASCII_COMPATIBLE_ENCODINGS {
+            let actual: String = {
+                let mut output = Output::new(enc);
+
+                let rewriter = HtmlRewriter::new(
+                    Settings {
+                        element_content_handlers: vec![],
+                        document_content_handlers: vec![doc_text!(|c| {
+                            let replace = match c.text_type() {
+                                TextType::PlainText => 'P',
+                                TextType::RCData => 'r',
+                                TextType::RawText => 'R',
+                                TextType::ScriptData => 'S',
+                                TextType::Data => '.',
+                                TextType::CDataSection => 'C',
+                            };
+                            let mut replaced: String = c
+                                .as_str()
+                                .chars()
+                                .map(|c| if c == '\n' { c } else { replace })
+                                .collect();
+                            if c.last_in_text_node() {
+                                replaced.push(';');
+                            }
+                            c.set_str(replaced);
+
+                            Ok(())
+                        })],
+                        encoding: enc.try_into().unwrap(),
+                        ..Settings::new()
+                    },
+                    |c: &[u8]| output.push(c),
+                );
+
+                write_chunks(
+                    rewriter,
+                    enc,
+                    &[
+                        "\n  <!doctype html> <title>rcdata</titlenot> <!--no comment rcdata</title>",
+                        "\n   <textarea>rc<x> --><!--no comment </TEXTAREA> ",
+                        "\n   body <!--> 1 </> 2 <noscript>nnnn</noscript>",
+                        "\n  <script>scr</script> <style>style</style>",
+                        "\n  <script><!-- scr --></script> <style>/*<![CDATA[*/ style /*]]>*/</style>",
+                        "\n  <svg> body <![CDATA[ cdata ]]> body",
+                        "\n  <script>scr</script> <style>style</style>",
+                        "\n  <script><!-- com -->s</script> <style>/*<![CDATA[*/ style /*]]>*/</style>",
+                        "\n  </svg>",
+                    ],
+                );
+
+                output.into()
+            };
+
+            assert_eq!(
+                actual,
+                "\
+                \n..;<!doctype html>.;<title>rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr;</title>\
+                \n...;<textarea>rrrrrrrrrrrrrrrrrrrrrrrr;</TEXTAREA>.\
+                \n........;<!-->...;</>...;<noscript>RRRR;</noscript>\
+                \n..;<script>SSS;</script>.;<style>RRRRR;</style>\
+                \n..;<script>SSSSSSSSSSSS;</script>.;<style>RRRRRRRRRRRRRRRRRRRRRRRRRRR;</style>\
+                \n..;<svg>......;<![CDATA[CCCCCCC;]]>.....\
+                \n..;<script>...;</script>.;<style>.....;</style>\
+                \n..;<script><!-- com -->.;</script>.;<style>..;<![CDATA[CCCCCCCCCCC;]]>..;</style>\
+                \n..;</svg>\
+                "
+            );
+        }
+    }
+
+    #[test]
     fn handler_invocation_order() {
-        let handlers_executed = Rc::new(RefCell::new(Vec::default()));
+        let handlers_executed = Arc::new(Mutex::new(Vec::default()));
 
         macro_rules! create_handlers {
             ($sel:expr, $idx:expr) => {
                 element!($sel, {
-                    let handlers_executed = Rc::clone(&handlers_executed);
+                    let handlers_executed = ::std::sync::Arc::clone(&handlers_executed);
 
                     move |_| {
-                        handlers_executed.borrow_mut().push($idx);
+                        handlers_executed.lock().unwrap().push($idx);
                         Ok(())
                     }
                 })
@@ -598,12 +711,12 @@ mod tests {
                     create_handlers!("[foo]", 3),
                     create_handlers!("div span[foo]", 4),
                 ],
-                ..RewriteStrSettings::default()
+                ..RewriteStrSettings::new()
             },
         )
         .unwrap();
 
-        assert_eq!(*handlers_executed.borrow(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(*handlers_executed.lock().unwrap(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -616,7 +729,7 @@ mod tests {
                     Ok(())
                 })],
                 enable_esi_tags: true,
-                ..RewriteStrSettings::default()
+                ..RewriteStrSettings::new()
             },
         )
         .unwrap();
@@ -629,7 +742,7 @@ mod tests {
         use crate::html_content::{ContentType, TextChunk};
 
         let enthusiastic_text_handler = || {
-            doc_text!(move |text: &mut TextChunk| {
+            doc_text!(move |text: &mut TextChunk<'_>| {
                 let new_text = text.as_str().replace('!', "!!!");
                 text.replace(&new_text, ContentType::Text);
                 Ok(())
@@ -641,7 +754,7 @@ mod tests {
                 .as_bytes()
                 .to_vec(),
             vec![0xd5, 0xec, 0xb3, 0xcb, 0xdc],
-            r#"!</body></html>"#.as_bytes().to_vec(),
+            br"!</body></html>".to_vec(),
         ]
         .into_iter()
         .concat();
@@ -659,7 +772,7 @@ mod tests {
             &html,
             Settings {
                 document_content_handlers: vec![enthusiastic_text_handler()],
-                ..Settings::default()
+                ..Settings::new()
             },
         );
 
@@ -671,7 +784,7 @@ mod tests {
             Settings {
                 document_content_handlers: vec![enthusiastic_text_handler()],
                 adjust_charset_on_meta_tag: true,
-                ..Settings::default()
+                ..Settings::new()
             },
         );
 
@@ -685,7 +798,7 @@ mod tests {
         use crate::html_content::{ContentType, TextChunk};
 
         let enthusiastic_text_handler = || {
-            doc_text!(move |text: &mut TextChunk| {
+            doc_text!(move |text: &mut TextChunk<'_>| {
                 let new_text = text.as_str().replace('!', "!!!");
                 text.replace(&new_text, ContentType::Text);
                 Ok(())
@@ -693,10 +806,11 @@ mod tests {
         };
 
         let html: Vec<u8> = [
-            r#"<meta http-equiv="content-type" content="text/html; charset=windows-1251"><html><head></head><body>I love "#.as_bytes().to_vec(),
-            vec![0xd5, 0xec, 0xb3, 0xcb, 0xdc],
-            r#"!</body></html>"#.as_bytes().to_vec(),
-        ].into_iter().concat();
+            r#"<meta http-equiv="conTent-type" content="text/html; charset=windows-1251"><html><head>"#.as_bytes(),
+            br#"<meta charset="utf-8"></head><body>I love "#, // second one should be ignored
+            &[0xd5, 0xec, 0xb3, 0xcb, 0xdc],
+            br"!</body></html>",
+        ].concat();
 
         let expected: Vec<u8> = html
             .iter()
@@ -711,7 +825,7 @@ mod tests {
             &html,
             Settings {
                 document_content_handlers: vec![enthusiastic_text_handler()],
-                ..Settings::default()
+                ..Settings::new()
             },
         );
 
@@ -723,7 +837,7 @@ mod tests {
             Settings {
                 document_content_handlers: vec![enthusiastic_text_handler()],
                 adjust_charset_on_meta_tag: true,
-                ..Settings::default()
+                ..Settings::new()
             },
         );
 
@@ -734,7 +848,9 @@ mod tests {
 
     mod fatal_errors {
         use super::*;
-        use crate::errors::MemoryLimitExceededError;
+        use crate::html_content::Comment;
+        use crate::memory::MemoryLimitExceededError;
+        use crate::rewritable_units::{Element, TextChunk};
 
         fn create_rewriter<O: OutputSink>(
             max_allowed_memory_usage: usize,
@@ -747,7 +863,7 @@ mod tests {
                         max_allowed_memory_usage,
                         preallocated_parsing_buffer_size: 0,
                     },
-                    ..Settings::default()
+                    ..Settings::new()
                 },
                 output_sink,
             )
@@ -788,9 +904,9 @@ mod tests {
 
         #[test]
         fn content_handler_error_propagation() {
-            fn assert_err(
-                element_handlers: ElementContentHandlers,
-                document_handlers: DocumentContentHandlers,
+            fn assert_err<'h>(
+                element_handlers: ElementContentHandlers<'h>,
+                document_handlers: DocumentContentHandlers<'h>,
                 expected_err: &'static str,
             ) {
                 use std::borrow::Cow;
@@ -802,7 +918,7 @@ mod tests {
                             element_handlers,
                         )],
                         document_content_handlers: vec![document_handlers],
-                        ..Settings::default()
+                        ..Settings::new()
                     },
                     |_: &[u8]| {},
                 );
@@ -814,9 +930,9 @@ mod tests {
 
                 let mut err = None;
 
-                for chunk in chunks.iter() {
+                for chunk in &chunks {
                     match rewriter.write(chunk.as_bytes()) {
-                        Ok(_) => (),
+                        Ok(()) => (),
                         Err(e) => {
                             err = Some(e);
                             break;
@@ -826,7 +942,7 @@ mod tests {
 
                 if err.is_none() {
                     match rewriter.end() {
-                        Ok(_) => (),
+                        Ok(()) => (),
                         Err(e) => err = Some(e),
                     }
                 }
@@ -856,21 +972,21 @@ mod tests {
 
             assert_err(
                 ElementContentHandlers::default()
-                    .element(|_| Err("Error in element handler".into())),
+                    .element(|_: &mut Element<'_, '_, _>| Err("Error in element handler".into())),
                 DocumentContentHandlers::default(),
                 "Error in element handler",
             );
 
             assert_err(
                 ElementContentHandlers::default()
-                    .comments(|_| Err("Error in element comment handler".into())),
+                    .comments(|_: &mut Comment<'_>| Err("Error in element comment handler".into())),
                 DocumentContentHandlers::default(),
                 "Error in element comment handler",
             );
 
             assert_err(
                 ElementContentHandlers::default()
-                    .text(|_| Err("Error in element text handler".into())),
+                    .text(|_: &mut TextChunk<'_>| Err("Error in element text handler".into())),
                 DocumentContentHandlers::default(),
                 "Error in element text handler",
             );

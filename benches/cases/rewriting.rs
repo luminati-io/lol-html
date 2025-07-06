@@ -1,5 +1,5 @@
-use lol_html::html_content::*;
-use lol_html::*;
+use lol_html::html_content::ContentType;
+use lol_html::{element, Settings};
 
 define_group!(
     "Rewriting",
@@ -13,7 +13,7 @@ define_group!(
 
                     Ok(())
                 })],
-                ..Settings::default()
+                ..Settings::new()
             }
         ),
         (
@@ -24,7 +24,7 @@ define_group!(
 
                     Ok(())
                 })],
-                ..Settings::default()
+                ..Settings::new()
             }
         )
     ]

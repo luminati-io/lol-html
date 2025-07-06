@@ -5,24 +5,24 @@ mod conditions;
 use crate::base::{Align, Bytes, Range};
 use crate::html::{LocalName, LocalNameHash, Namespace, TextType};
 use crate::parser::state_machine::{FeedbackDirective, StateMachine, StateResult};
-use crate::parser::{
-    ParserDirective, ParsingAmbiguityError, TreeBuilderFeedback, TreeBuilderSimulator,
-};
+use crate::parser::{ParserContext, ParserDirective, ParsingAmbiguityError, TreeBuilderFeedback};
 use crate::rewriter::RewritingError;
-use std::cell::RefCell;
 use std::cmp::min;
-use std::rc::Rc;
 
-pub trait TagHintSink {
+pub(crate) trait TagHintSink {
     fn handle_start_tag_hint(
         &mut self,
-        name: LocalName,
+        name: LocalName<'_>,
         ns: Namespace,
     ) -> Result<ParserDirective, RewritingError>;
-    fn handle_end_tag_hint(&mut self, name: LocalName) -> Result<ParserDirective, RewritingError>;
+    fn handle_end_tag_hint(
+        &mut self,
+        name: LocalName<'_>,
+    ) -> Result<ParserDirective, RewritingError>;
 }
 
-pub type State<S> = fn(&mut TagScanner<S>, &[u8]) -> StateResult;
+pub(crate) type State<S> =
+    fn(&mut TagScanner<S>, context: &mut ParserContext<S>, &[u8]) -> StateResult;
 
 /// Tag scanner skips the majority of lexer operations and, thus,
 /// is faster. It also has much less requirements for buffering which makes it more
@@ -35,7 +35,7 @@ pub type State<S> = fn(&mut TagScanner<S>, &[u8]) -> StateResult;
 /// of the input (e.g. `<div` will produce a tag preview, but not tag token). However,
 /// it's not a concern for our use case as no content will be erroneously captured
 /// in this case.
-pub struct TagScanner<S: TagHintSink> {
+pub(crate) struct TagScanner<S> {
     next_pos: usize,
     is_last_input: bool,
     tag_start: Option<usize>,
@@ -46,20 +46,15 @@ pub struct TagScanner<S: TagHintSink> {
     last_start_tag_name_hash: LocalNameHash,
     is_state_enter: bool,
     cdata_allowed: bool,
-    tag_hint_sink: S,
     state: State<S>,
     closing_quote: u8,
-    tree_builder_simulator: Rc<RefCell<TreeBuilderSimulator>>,
     pending_text_type_change: Option<TextType>,
     last_text_type: TextType,
 }
 
 impl<S: TagHintSink> TagScanner<S> {
-    pub fn new(
-        tag_hint_sink: S,
-        tree_builder_simulator: Rc<RefCell<TreeBuilderSimulator>>,
-    ) -> Self {
-        TagScanner {
+    pub fn new() -> Self {
+        Self {
             next_pos: 0,
             is_last_input: false,
             tag_start: None,
@@ -70,10 +65,8 @@ impl<S: TagHintSink> TagScanner<S> {
             last_start_tag_name_hash: LocalNameHash::default(),
             is_state_enter: true,
             cdata_allowed: false,
-            tag_hint_sink,
-            state: TagScanner::data_state,
+            state: Self::data_state,
             closing_quote: b'"',
-            tree_builder_simulator,
             pending_text_type_change: None,
             last_text_type: TextType::Data,
         }
@@ -81,6 +74,7 @@ impl<S: TagHintSink> TagScanner<S> {
 
     fn emit_tag_hint(
         &mut self,
+        context: &mut ParserContext<S>,
         input: &[u8],
         is_in_end_tag: bool,
     ) -> Result<ParserDirective, RewritingError> {
@@ -89,32 +83,35 @@ impl<S: TagHintSink> TagScanner<S> {
             end: self.pos(),
         };
 
-        let input_bytes = Bytes::from(input);
+        let input_bytes = Bytes::new(input);
         let name = LocalName::new(&input_bytes, name_range, self.tag_name_hash);
 
         trace!(@output name);
 
         if is_in_end_tag {
-            self.tag_hint_sink.handle_end_tag_hint(name)
+            context.output_sink.handle_end_tag_hint(name)
         } else {
             self.last_start_tag_name_hash = self.tag_name_hash;
 
-            let ns = self.tree_builder_simulator.borrow_mut().current_ns();
+            let ns = context.tree_builder_simulator.current_ns();
 
-            self.tag_hint_sink.handle_start_tag_hint(name, ns)
+            context.output_sink.handle_start_tag_hint(name, ns)
         }
     }
 
     #[inline]
     fn try_apply_tree_builder_feedback(
         &mut self,
+        context: &mut ParserContext<S>,
     ) -> Result<Option<TreeBuilderFeedback>, ParsingAmbiguityError> {
-        let mut tree_builder_simulator = self.tree_builder_simulator.borrow_mut();
-
         let feedback = if self.is_in_end_tag {
-            tree_builder_simulator.get_feedback_for_end_tag(self.tag_name_hash)
+            context
+                .tree_builder_simulator
+                .get_feedback_for_end_tag(self.tag_name_hash)
         } else {
-            tree_builder_simulator.get_feedback_for_start_tag(self.tag_name_hash)?
+            context
+                .tree_builder_simulator
+                .get_feedback_for_start_tag(self.tag_name_hash)?
         };
 
         Ok(match feedback {
@@ -135,12 +132,13 @@ impl<S: TagHintSink> TagScanner<S> {
 
     #[inline]
     fn take_feedback_directive(&mut self) -> FeedbackDirective {
-        match self.pending_text_type_change.take() {
-            Some(text_type) => FeedbackDirective::ApplyUnhandledFeedback(
-                TreeBuilderFeedback::SwitchTextType(text_type),
-            ),
-            None => FeedbackDirective::Skip,
-        }
+        self.pending_text_type_change
+            .take()
+            .map_or(FeedbackDirective::Skip, |text_type| {
+                FeedbackDirective::ApplyUnhandledFeedback(TreeBuilderFeedback::SwitchTextType(
+                    text_type,
+                ))
+            })
     }
 }
 

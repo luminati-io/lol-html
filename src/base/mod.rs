@@ -5,8 +5,11 @@ mod align;
 mod bytes;
 mod encoding;
 mod range;
+mod spanned;
 
-pub use self::align::Align;
-pub use self::bytes::{Bytes, HasReplacementsError};
+pub(crate) use self::align::Align;
+pub(crate) use self::bytes::{Bytes, BytesCow, HasReplacementsError};
 pub use self::encoding::SharedEncoding;
-pub use self::range::Range;
+pub(crate) use self::range::Range;
+pub use self::spanned::SourceLocation;
+pub(crate) use self::spanned::{Spanned, SpannedRawBytes};

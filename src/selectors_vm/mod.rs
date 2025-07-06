@@ -1,3 +1,5 @@
+#![allow(clippy::needless_pass_by_value)]
+
 mod ast;
 mod attribute_matcher;
 mod compiler;
@@ -14,27 +16,28 @@ use crate::transform_stream::AuxStartTagInfo;
 use encoding_rs::Encoding;
 
 pub use self::ast::*;
-pub use self::attribute_matcher::AttributeMatcher;
-pub use self::compiler::Compiler;
+pub(crate) use self::attribute_matcher::AttributeMatcher;
+pub(crate) use self::compiler::Compiler;
 pub use self::error::SelectorError;
 pub use self::parser::Selector;
-pub use self::program::{ExecutionBranch, Program, TryExecResult};
-pub use self::stack::{ChildCounter, ElementData, Stack, StackItem};
+pub(crate) use self::program::{ExecutionBranch, Program, TryExecResult};
+pub(crate) use self::stack::{ChildCounter, ElementData, Stack, StackItem};
 
-pub struct MatchInfo<P> {
+pub(crate) struct MatchInfo<P> {
     pub payload: P,
     pub with_content: bool,
 }
 
-pub type AuxStartTagInfoRequest<E, P> = Box<
+pub(crate) type AuxStartTagInfoRequest<E, P> = Box<
     dyn FnOnce(
-        &mut SelectorMatchingVm<E>,
-        AuxStartTagInfo,
-        &mut dyn FnMut(MatchInfo<P>),
-    ) -> Result<(), MemoryLimitExceededError>,
+            &mut SelectorMatchingVm<E>,
+            AuxStartTagInfo<'_>,
+            &mut dyn FnMut(MatchInfo<P>),
+        ) -> Result<(), MemoryLimitExceededError>
+        + Send,
 >;
 
-pub enum VmError<E: ElementData, MatchPayload> {
+pub(crate) enum VmError<E: ElementData, MatchPayload> {
     InfoRequest(AuxStartTagInfoRequest<E, MatchPayload>),
     MemoryLimitExceeded(MemoryLimitExceededError),
 }
@@ -42,7 +45,7 @@ pub enum VmError<E: ElementData, MatchPayload> {
 type RecoveryPointHandler<T, E, P> = fn(
     &mut SelectorMatchingVm<E>,
     &mut ExecutionCtx<'static, E>,
-    &AttributeMatcher,
+    &AttributeMatcher<'_>,
     T,
     &mut dyn FnMut(MatchInfo<P>),
 );
@@ -66,7 +69,7 @@ struct Bailout<T> {
 }
 
 /// A container for tracking state from various places on the stack.
-pub struct SelectorState<'i> {
+pub(crate) struct SelectorState<'i> {
     pub cumulative: &'i ChildCounter,
     pub typed: Option<&'i ChildCounter>,
 }
@@ -94,7 +97,7 @@ impl<'i, E: ElementData> ExecutionCtx<'i, E> {
         branch: &ExecutionBranch<E::MatchPayload>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
-        for &payload in branch.matched_payload.iter() {
+        for &payload in &branch.matched_payload {
             let element_payload = self.stack_item.element_data.matched_payload_mut();
 
             if !element_payload.contains(&payload) {
@@ -137,14 +140,18 @@ macro_rules! aux_info_request {
     };
 }
 
-pub struct SelectorMatchingVm<E: ElementData> {
+pub(crate) struct SelectorMatchingVm<E: ElementData> {
     program: Program<E::MatchPayload>,
     stack: Stack<E>,
     enable_esi_tags: bool,
 }
 
-impl<E: ElementData> SelectorMatchingVm<E> {
+impl<E> SelectorMatchingVm<E>
+where
+    E: ElementData + Send,
+{
     #[inline]
+    #[must_use]
     pub fn new(
         ast: Ast<E::MatchPayload>,
         encoding: &'static Encoding,
@@ -154,7 +161,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
         let program = Compiler::new(encoding).compile(ast);
         let enable_nth_of_type = program.enable_nth_of_type;
 
-        SelectorMatchingVm {
+        Self {
             program,
             enable_esi_tags,
             stack: Stack::new(memory_limiter, enable_nth_of_type),
@@ -163,7 +170,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     pub fn exec_for_start_tag(
         &mut self,
-        local_name: LocalName,
+        local_name: LocalName<'_>,
         ns: Namespace,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), VmError<E, E::MatchPayload>> {
@@ -191,7 +198,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     #[inline]
     pub fn exec_for_end_tag(
         &mut self,
-        local_name: LocalName,
+        local_name: LocalName<'_>,
         unmatched_element_data_handler: impl FnMut(E),
     ) {
         self.stack
@@ -207,10 +214,10 @@ impl<E: ElementData> SelectorMatchingVm<E> {
         &mut self,
         mut ctx: ExecutionCtx<'static, E>,
         ns: Namespace,
-        aux_info: AuxStartTagInfo,
+        aux_info: AuxStartTagInfo<'_>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), MemoryLimitExceededError> {
-        let attr_matcher = AttributeMatcher::new(aux_info.input, aux_info.attr_buffer, ns);
+        let attr_matcher = AttributeMatcher::new(*aux_info.input, aux_info.attr_buffer, ns);
 
         ctx.with_content = !aux_info.self_closing;
 
@@ -238,15 +245,15 @@ impl<E: ElementData> SelectorMatchingVm<E> {
         Ok(())
     }
 
-    fn bailout<T: 'static>(
-        ctx: ExecutionCtx<E>,
+    fn bailout<T: 'static + Send>(
+        ctx: ExecutionCtx<'_, E>,
         bailout: Bailout<T>,
         recovery_point_handler: RecoveryPointHandler<T, E, E::MatchPayload>,
     ) -> Result<(), VmError<E, E::MatchPayload>> {
         let mut ctx = ctx.into_owned();
 
         aux_info_request!(move |this, aux_info, match_handler| {
-            let attr_matcher = AttributeMatcher::new(aux_info.input, aux_info.attr_buffer, ctx.ns);
+            let attr_matcher = AttributeMatcher::new(*aux_info.input, aux_info.attr_buffer, ctx.ns);
 
             this.complete_instr_execution_with_attrs(
                 bailout.at_addr,
@@ -274,7 +281,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn recover_after_bailout_in_entry_points(
         &mut self,
         ctx: &mut ExecutionCtx<'static, E>,
-        attr_matcher: &AttributeMatcher,
+        attr_matcher: &AttributeMatcher<'_>,
         recovery_point: usize,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -299,7 +306,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn recover_after_bailout_in_jumps(
         &mut self,
         ctx: &mut ExecutionCtx<'static, E>,
-        attr_matcher: &AttributeMatcher,
+        attr_matcher: &AttributeMatcher<'_>,
         recovery_point: JumpPtr,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -317,7 +324,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn recover_after_bailout_in_hereditary_jumps(
         &mut self,
         ctx: &mut ExecutionCtx<'static, E>,
-        attr_matcher: &AttributeMatcher,
+        attr_matcher: &AttributeMatcher<'_>,
         recovery_point: HereditaryJumpPtr,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -326,7 +333,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     fn exec_without_attrs(
         &mut self,
-        mut ctx: ExecutionCtx<E>,
+        mut ctx: ExecutionCtx<'_, E>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), VmError<E, E::MatchPayload>> {
         if let Err(b) = self.try_exec_instr_set_without_attrs(
@@ -358,8 +365,8 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn complete_instr_execution_with_attrs(
         &self,
         addr: usize,
-        attr_matcher: &AttributeMatcher,
-        ctx: &mut ExecutionCtx<E>,
+        attr_matcher: &AttributeMatcher<'_>,
+        ctx: &mut ExecutionCtx<'_, E>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
         let state = self.stack.build_state(&ctx.stack_item.local_name);
@@ -374,7 +381,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn try_exec_instr_set_without_attrs(
         &self,
         addr_range: AddressRange,
-        ctx: &mut ExecutionCtx<E>,
+        ctx: &mut ExecutionCtx<'_, E>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), Bailout<usize>> {
         let start = addr_range.start;
@@ -391,7 +398,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
                         recovery_point: addr - start + 1,
                     });
                 }
-                _ => (),
+                TryExecResult::Fail => (),
             }
         }
 
@@ -402,8 +409,8 @@ impl<E: ElementData> SelectorMatchingVm<E> {
     fn exec_instr_set_with_attrs(
         &self,
         addr_range: &AddressRange,
-        attr_matcher: &AttributeMatcher,
-        ctx: &mut ExecutionCtx<E>,
+        attr_matcher: &AttributeMatcher<'_>,
+        ctx: &mut ExecutionCtx<'_, E>,
         offset: usize,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -419,7 +426,7 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     fn try_exec_jumps_without_attrs(
         &self,
-        ctx: &mut ExecutionCtx<E>,
+        ctx: &mut ExecutionCtx<'_, E>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), Bailout<JumpPtr>> {
         if let Some(parent) = self.stack.items().last() {
@@ -440,8 +447,8 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     fn exec_jumps_with_attrs(
         &self,
-        attr_matcher: &AttributeMatcher,
-        ctx: &mut ExecutionCtx<E>,
+        attr_matcher: &AttributeMatcher<'_>,
+        ctx: &mut ExecutionCtx<'_, E>,
         ptr: JumpPtr,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -466,13 +473,13 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     fn try_exec_hereditary_jumps_without_attrs(
         &self,
-        ctx: &mut ExecutionCtx<E>,
+        ctx: &mut ExecutionCtx<'_, E>,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) -> Result<(), Bailout<HereditaryJumpPtr>> {
         for (i, ancestor) in self.stack.items().iter().rev().enumerate() {
-            for (j, jumps) in ancestor.hereditary_jumps.iter().cloned().enumerate() {
-                self.try_exec_instr_set_without_attrs(jumps, ctx, match_handler)
-                    .map_err(|b| Bailout {
+            for (j, jumps) in ancestor.hereditary_jumps.iter().enumerate() {
+                self.try_exec_instr_set_without_attrs(jumps.clone(), ctx, match_handler)
+                    .map_err(move |b| Bailout {
                         at_addr: b.at_addr,
                         recovery_point: HereditaryJumpPtr {
                             stack_offset: i,
@@ -492,8 +499,8 @@ impl<E: ElementData> SelectorMatchingVm<E> {
 
     fn exec_hereditary_jumps_with_attrs(
         &self,
-        attr_matcher: &AttributeMatcher,
-        ctx: &mut ExecutionCtx<E>,
+        attr_matcher: &AttributeMatcher<'_>,
+        ctx: &mut ExecutionCtx<'_, E>,
         ptr: HereditaryJumpPtr,
         match_handler: &mut dyn FnMut(MatchInfo<E::MatchPayload>),
     ) {
@@ -549,7 +556,7 @@ mod tests {
     use crate::base::SharedEncoding;
     use crate::errors::RewritingError;
     use crate::html::Namespace;
-    use crate::memory::MemoryLimiter;
+    use crate::memory::SharedMemoryLimiter;
     use crate::rewritable_units::{DocumentEnd, Token, TokenCaptureFlags};
     use crate::rewriter::AsciiCompatibleEncoding;
     use crate::transform_stream::{
@@ -576,10 +583,43 @@ mod tests {
         }
     }
 
+    struct TestTransformController<T: FnMut(&mut Token<'_>)>(T);
+
+    impl<T: FnMut(&mut Token<'_>)> TransformController for TestTransformController<T> {
+        fn initial_capture_flags(&self) -> TokenCaptureFlags {
+            TokenCaptureFlags::all()
+        }
+
+        fn handle_start_tag(
+            &mut self,
+            _: LocalName<'_>,
+            _: Namespace,
+        ) -> StartTagHandlingResult<Self> {
+            Ok(TokenCaptureFlags::NEXT_START_TAG)
+        }
+
+        fn handle_end_tag(&mut self, _: LocalName<'_>) -> TokenCaptureFlags {
+            TokenCaptureFlags::all()
+        }
+
+        fn handle_end(&mut self, _: &mut DocumentEnd<'_>) -> Result<(), RewritingError> {
+            Ok(())
+        }
+
+        fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError> {
+            (self.0)(token);
+            Ok(())
+        }
+
+        fn should_emit_content(&self) -> bool {
+            true
+        }
+    }
+
     pub fn test_with_token(
         html: &str,
         encoding: &'static Encoding,
-        test_fn: impl FnMut(&mut Token),
+        test_fn: impl FnMut(&mut Token<'_>),
     ) {
         let (html, _, has_unmappable_characters) = encoding.encode(html);
 
@@ -594,45 +634,12 @@ mod tests {
             return;
         }
 
-        pub struct TestTransformController<T: FnMut(&mut Token)>(T);
-
-        impl<T: FnMut(&mut Token)> TransformController for TestTransformController<T> {
-            fn initial_capture_flags(&self) -> TokenCaptureFlags {
-                TokenCaptureFlags::all()
-            }
-
-            fn handle_start_tag(
-                &mut self,
-                _: LocalName,
-                _: Namespace,
-            ) -> StartTagHandlingResult<Self> {
-                Ok(TokenCaptureFlags::NEXT_START_TAG)
-            }
-
-            fn handle_end_tag(&mut self, _: LocalName) -> TokenCaptureFlags {
-                TokenCaptureFlags::all()
-            }
-
-            fn handle_end(&mut self, _: &mut DocumentEnd) -> Result<(), RewritingError> {
-                Ok(())
-            }
-
-            fn handle_token(&mut self, token: &mut Token) -> Result<(), RewritingError> {
-                (self.0)(token);
-                Ok(())
-            }
-
-            fn should_emit_content(&self) -> bool {
-                true
-            }
-        }
-
         let mut transform_stream = TransformStream::new(TransformStreamSettings {
             transform_controller: TestTransformController(test_fn),
             output_sink: |_: &[u8]| {},
             preallocated_parsing_buffer_size: 0,
             encoding: SharedEncoding::new(AsciiCompatibleEncoding::new(encoding).unwrap()),
-            memory_limiter: MemoryLimiter::new_shared(2048),
+            memory_limiter: SharedMemoryLimiter::new(2048),
             strict: true,
         });
 
@@ -667,7 +674,7 @@ mod tests {
                 ast.add_selector(&selector.parse().unwrap(), i);
             }
 
-            let memory_limiter = MemoryLimiter::new_shared(2048);
+            let memory_limiter = SharedMemoryLimiter::new(2048);
             let enable_esi_tags = false;
             let vm: SelectorMatchingVm<TestElementData> =
                 SelectorMatchingVm::new(ast, UTF_8, memory_limiter, enable_esi_tags);

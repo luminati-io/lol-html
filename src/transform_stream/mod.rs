@@ -1,17 +1,15 @@
 mod dispatcher;
 
 use self::dispatcher::Dispatcher;
+pub use self::dispatcher::OutputSink;
+pub(crate) use self::dispatcher::{AuxStartTagInfo, DispatcherError};
+pub use self::dispatcher::{StartTagHandlingResult, TransformController};
 use crate::base::SharedEncoding;
 use crate::memory::{Arena, SharedMemoryLimiter};
-use crate::parser::{Parser, ParserDirective, SharedAttributeBuffer};
+use crate::parser::{Parser, ParserDirective};
 use crate::rewriter::RewritingError;
-use std::cell::RefCell;
-use std::rc::Rc;
 
-pub use self::dispatcher::{
-    AuxStartTagInfo, DispatcherError, OutputSink, StartTagHandlingResult, TransformController,
-};
-
+// Pub only for integration tests
 pub struct TransformStreamSettings<C, O>
 where
     C: TransformController,
@@ -25,12 +23,12 @@ where
     pub strict: bool,
 }
 
+// Pub only for integration tests
 pub struct TransformStream<C, O>
 where
     C: TransformController,
     O: OutputSink,
 {
-    dispatcher: Rc<RefCell<Dispatcher<C, O>>>,
     parser: Parser<Dispatcher<C, O>>,
     buffer: Arena,
     has_buffered_data: bool,
@@ -52,45 +50,24 @@ where
             ParserDirective::Lex
         };
 
-        let dispatcher = Rc::new(RefCell::new(Dispatcher::new(
+        let dispatcher = Dispatcher::new(
             settings.transform_controller,
             settings.output_sink,
             settings.encoding,
-        )));
+        );
 
         let buffer = Arena::new(
             settings.memory_limiter,
             settings.preallocated_parsing_buffer_size,
         );
 
-        let parser = Parser::new(&dispatcher, initial_parser_directive, settings.strict);
+        let parser = Parser::new(dispatcher, initial_parser_directive, settings.strict);
 
-        TransformStream {
-            dispatcher,
+        Self {
             parser,
             buffer,
             has_buffered_data: false,
         }
-    }
-
-    fn buffer_blocked_bytes(
-        &mut self,
-        data: &[u8],
-        consumed_byte_count: usize,
-    ) -> Result<(), RewritingError> {
-        if self.has_buffered_data {
-            self.buffer.shift(consumed_byte_count);
-        } else {
-            self.buffer
-                .init_with(&data[consumed_byte_count..])
-                .map_err(RewritingError::MemoryLimitExceeded)?;
-
-            self.has_buffered_data = true;
-        }
-
-        trace!(@buffer self.buffer);
-
-        Ok(())
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), RewritingError> {
@@ -110,12 +87,22 @@ where
 
         let consumed_byte_count = self.parser.parse(chunk, false)?;
 
-        self.dispatcher
-            .borrow_mut()
+        self.parser
+            .get_dispatcher()
             .flush_remaining_input(chunk, consumed_byte_count);
 
         if consumed_byte_count < chunk.len() {
-            self.buffer_blocked_bytes(data, consumed_byte_count)?;
+            if self.has_buffered_data {
+                self.buffer.shift(consumed_byte_count);
+            } else if let Some(unconsumed) = data.get(consumed_byte_count..) {
+                self.buffer
+                    .init_with(unconsumed)
+                    .map_err(RewritingError::MemoryLimitExceeded)?;
+
+                self.has_buffered_data = true;
+            } else {
+                debug_assert!(false);
+            }
         } else {
             self.has_buffered_data = false;
         }
@@ -135,10 +122,11 @@ where
         trace!(@chunk chunk);
 
         self.parser.parse(chunk, true)?;
-        self.dispatcher.borrow_mut().finish(chunk)
+        self.parser.get_dispatcher().finish(chunk)
     }
 
     #[cfg(feature = "integration_test")]
+    #[allow(private_interfaces)]
     pub fn parser(&mut self) -> &mut Parser<Dispatcher<C, O>> {
         &mut self.parser
     }

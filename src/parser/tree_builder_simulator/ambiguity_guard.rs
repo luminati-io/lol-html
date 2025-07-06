@@ -72,7 +72,8 @@ pub struct ParsingAmbiguityError {
 }
 
 impl Display for ParsingAmbiguityError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             concat!(
@@ -96,7 +97,7 @@ impl Display for ParsingAmbiguityError {
 // tag name hashes and the corresponding tag name strings.
 macro_rules! create_assert_for_tags {
     ( $($tag:ident),+ ) => {
-        #[inline]
+        #[cold]
         fn tag_hash_to_string(tag_name: LocalNameHash) -> String {
             match tag_name {
                 $(t if t == Tag::$tag => stringify!($tag).to_string().to_lowercase(),)+
@@ -131,13 +132,13 @@ enum State {
     InOrAfterFrameset,
 }
 
-pub struct AmbiguityGuard {
+pub(crate) struct AmbiguityGuard {
     state: State,
 }
 
 impl Default for AmbiguityGuard {
     fn default() -> Self {
-        AmbiguityGuard {
+        Self {
             state: State::Default,
         }
     }
@@ -179,7 +180,7 @@ impl AmbiguityGuard {
             State::InOrAfterFrameset => {
                 // NOTE: <noframes> is allowed in and after <frameset>.
                 if tag_name != Tag::Noframes {
-                    assert_not_ambigious_text_type_switch(tag_name)?
+                    assert_not_ambigious_text_type_switch(tag_name)?;
                 }
             }
         }

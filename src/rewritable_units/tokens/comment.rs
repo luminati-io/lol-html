@@ -1,5 +1,9 @@
 use super::{Mutations, Token};
-use crate::base::Bytes;
+use crate::base::{Bytes, BytesCow};
+use crate::base::{SourceLocation, SpannedRawBytes};
+use crate::errors::RewritingError;
+use crate::html_content::{StreamingHandler, StreamingHandlerSink};
+use crate::rewritable_units::StringChunk;
 use encoding_rs::Encoding;
 use std::any::Any;
 use std::fmt::{self, Debug};
@@ -23,32 +27,40 @@ pub enum CommentTextError {
 ///
 /// Exposes API for examination and modification of a parsed HTML comment.
 pub struct Comment<'i> {
-    text: Bytes<'i>,
-    raw: Option<Bytes<'i>>,
+    text: BytesCow<'i>,
+    raw: SpannedRawBytes<'i>,
     encoding: &'static Encoding,
     mutations: Mutations,
     user_data: Box<dyn Any>,
 }
 
 impl<'i> Comment<'i> {
+    #[inline]
+    #[must_use]
     pub(super) fn new_token(
         text: Bytes<'i>,
-        raw: Bytes<'i>,
+        raw: SpannedRawBytes<'i>,
         encoding: &'static Encoding,
     ) -> Token<'i> {
         Token::Comment(Comment {
-            text,
-            raw: Some(raw),
+            text: text.into(),
+            raw,
             encoding,
-            mutations: Mutations::new(encoding),
+            mutations: Mutations::new(),
             user_data: Box::new(()),
         })
     }
 
     /// Returns the text of the comment.
     #[inline]
+    #[must_use]
     pub fn text(&self) -> String {
         self.text.as_string(self.encoding)
+    }
+
+    #[inline(always)]
+    pub(crate) fn encoding(&self) -> &'static Encoding {
+        self.encoding
     }
 
     /// Sets the text of the comment.
@@ -61,10 +73,10 @@ impl<'i> Comment<'i> {
             // encoding then encoding_rs replaces it with a numeric
             // character reference. Character references are not
             // supported in comments, so we need to bail.
-            match Bytes::from_str_without_replacements(text, self.encoding) {
+            match BytesCow::from_str_without_replacements(text, self.encoding) {
                 Ok(text) => {
                     self.text = text.into_owned();
-                    self.raw = None;
+                    self.raw.set_modified();
 
                     Ok(())
                 }
@@ -94,7 +106,7 @@ impl<'i> Comment<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -102,7 +114,23 @@ impl<'i> Comment<'i> {
     /// ```
     #[inline]
     pub fn before(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.before(content, content_type);
+        self.mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::from_str(content, content_type));
+    }
+
+    /// Inserts content from a [`StreamingHandler`] before the comment.
+    ///
+    /// Consequent calls to the method append to the previously inserted content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    #[inline]
+    pub fn streaming_before(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::stream(string_writer));
     }
 
     /// Inserts `content` after the comment.
@@ -126,7 +154,7 @@ impl<'i> Comment<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -134,7 +162,23 @@ impl<'i> Comment<'i> {
     /// ```
     #[inline]
     pub fn after(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.after(content, content_type);
+        self.mutations
+            .mutate()
+            .content_after
+            .push_front(StringChunk::from_str(content, content_type));
+    }
+
+    /// Inserts content from a [`StreamingHandler`] after the comment.
+    ///
+    /// Consequent calls to the method prepend to the previously inserted content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    #[inline]
+    pub fn streaming_after(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .content_after
+            .push_front(StringChunk::stream(string_writer));
     }
 
     /// Replaces the comment with the `content`.
@@ -158,7 +202,7 @@ impl<'i> Comment<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -166,31 +210,54 @@ impl<'i> Comment<'i> {
     /// ```
     #[inline]
     pub fn replace(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.replace(content, content_type);
+        self.mutations
+            .mutate()
+            .replace(StringChunk::from_str(content, content_type));
+    }
+
+    /// Replaces the comment with the content from a [`StreamingHandler`].
+    ///
+    /// Consequent calls to the method overwrite previous replacement content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    #[inline]
+    pub fn streaming_replace(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .replace(StringChunk::stream(string_writer));
     }
 
     /// Removes the comment.
     #[inline]
     pub fn remove(&mut self) {
-        self.mutations.remove();
+        self.mutations.mutate().remove();
     }
 
     /// Returns `true` if the comment has been replaced or removed.
     #[inline]
+    #[must_use]
     pub fn removed(&self) -> bool {
         self.mutations.removed()
     }
 
     #[inline]
-    fn raw(&self) -> Option<&Bytes> {
-        self.raw.as_ref()
+    fn serialize_self(&self, sink: &mut StreamingHandlerSink<'_>) -> Result<(), RewritingError> {
+        let output_handler = sink.output_handler();
+
+        if let Some(raw) = self.raw.original() {
+            output_handler(raw);
+        } else {
+            output_handler(b"<!--");
+            output_handler(&self.text);
+            output_handler(b"-->");
+        }
+        Ok(())
     }
 
-    #[inline]
-    fn serialize_from_parts(&self, output_handler: &mut dyn FnMut(&[u8])) {
-        output_handler(b"<!--");
-        output_handler(&self.text);
-        output_handler(b"-->");
+    /// Position of this comment in the source document, before any rewriting
+    #[must_use]
+    pub fn source_location(&self) -> SourceLocation {
+        self.raw.source_location()
     }
 }
 
@@ -198,9 +265,11 @@ impl_serialize!(Comment);
 impl_user_data!(Comment<'_>);
 
 impl Debug for Comment<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Comment")
             .field("text", &self.text())
+            .field("at", &self.source_location())
             .finish()
     }
 }
@@ -216,7 +285,7 @@ mod tests {
     fn rewrite_comment(
         html: &[u8],
         encoding: &'static Encoding,
-        mut handler: impl FnMut(&mut Comment),
+        mut handler: impl FnMut(&mut Comment<'_>),
     ) -> String {
         let mut handler_called = false;
 
@@ -234,6 +303,27 @@ mod tests {
         assert!(handler_called);
 
         output
+    }
+
+    #[test]
+    fn sanitizer_bypass() {
+        // HTML allows comments to be closed in multiple invalid ways
+        let out = rewrite_comment(b"<!--><img> surprise-->", UTF_8, |c| {
+            c.set_text("comment closes early").unwrap();
+        });
+        assert_eq!("<!--comment closes early--><img> surprise-->", out);
+        let out = rewrite_comment(b"<!-- --!><p><!---></p>", UTF_8, |c| {
+            c.set_text("unusual ending").unwrap();
+        });
+        assert_eq!("<!--unusual ending--><p><!--unusual ending--></p>", out);
+    }
+
+    #[test]
+    fn sanitizer_bypass2() {
+        let out = rewrite_comment(b"<?xml >s<img src=x onerror=alert(1)> ?>", UTF_8, |c| {
+            c.set_text("pie is a lie!").unwrap();
+        });
+        assert_eq!("<!--pie is a lie!-->s<img src=x onerror=alert(1)> ?>", out);
     }
 
     #[test]
@@ -324,7 +414,11 @@ mod tests {
                     assert!(c.removed());
 
                     c.before("<before>", ContentType::Html);
-                    c.after("<after>", ContentType::Html);
+                    c.streaming_after(Box::new(|s: &mut StreamingHandlerSink<'_>| {
+                        s.write_str("<af", ContentType::Html);
+                        s.write_str("ter>", ContentType::Html);
+                        Ok(())
+                    }));
                 },
                 "<before><after>"
             );
@@ -341,7 +435,11 @@ mod tests {
 
                     c.replace("<div></div>", ContentType::Html);
                     c.replace("<!--42-->", ContentType::Html);
-                    c.replace("<foo & bar>", ContentType::Text);
+                    c.streaming_replace(streaming!(|h| {
+                        h.write_str("<foo &", ContentType::Text);
+                        h.write_str(" bar>", ContentType::Text);
+                        Ok(())
+                    }));
 
                     assert!(c.removed());
                 },

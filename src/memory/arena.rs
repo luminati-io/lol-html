@@ -3,37 +3,37 @@ use super::{MemoryLimitExceededError, SharedMemoryLimiter};
 /// Preallocated region of memory that can grow and never deallocates during the lifetime of
 /// the limiter.
 #[derive(Debug)]
-pub struct Arena {
+pub(crate) struct Arena {
     limiter: SharedMemoryLimiter,
     data: Vec<u8>,
 }
 
 impl Arena {
     pub fn new(limiter: SharedMemoryLimiter, preallocated_size: usize) -> Self {
-        limiter.borrow_mut().preallocate(preallocated_size);
+        limiter.preallocate(preallocated_size);
 
-        Arena {
+        Self {
             limiter,
             data: Vec::with_capacity(preallocated_size),
         }
     }
 
     pub fn append(&mut self, slice: &[u8]) -> Result<(), MemoryLimitExceededError> {
-        let new_len = self.data.len() + slice.len();
-        let capacity = self.data.capacity();
+        // this specific form of capacity check optimizes out redundant resizing in extend_from_slice
+        if self.data.capacity() - self.data.len() < slice.len() {
+            let additional = slice.len() + self.data.len() - self.data.capacity();
 
-        if new_len > capacity {
-            let additional = new_len - capacity;
-
-            // NOTE: approximate usage, as `Vec::reserve_exact` doesn't
+            // NOTE: approximate usage, as `Vec::(try_)reserve_exact` doesn't
             // give guarantees about exact capacity value :).
-            self.limiter.borrow_mut().increase_usage(additional)?;
+            self.limiter.increase_usage(additional)?;
 
-            // NOTE: with wicely choosen preallocated size this branch should be
+            // NOTE: with wisely chosen preallocated size this branch should be
             // executed quite rarely. We can't afford to use double capacity
             // strategy used by default (see: https://github.com/rust-lang/rust/blob/bdfd698f37184da42254a03ed466ab1f90e6fb6c/src/liballoc/raw_vec.rs#L424)
             // as we'll run out of the space allowance quite quickly.
-            self.data.reserve_exact(slice.len());
+            self.data
+                .try_reserve_exact(slice.len())
+                .map_err(|_| MemoryLimitExceededError)?;
         }
 
         self.data.extend_from_slice(slice);
@@ -58,26 +58,25 @@ impl Arena {
 
 #[cfg(test)]
 mod tests {
-    use super::super::limiter::MemoryLimiter;
+    use super::super::limiter::SharedMemoryLimiter;
     use super::*;
-    use std::rc::Rc;
 
     #[test]
     fn append() {
-        let limiter = MemoryLimiter::new_shared(10);
-        let mut arena = Arena::new(Rc::clone(&limiter), 2);
+        let limiter = SharedMemoryLimiter::new(10);
+        let mut arena = Arena::new(limiter.clone(), 2);
 
         arena.append(&[1, 2]).unwrap();
         assert_eq!(arena.bytes(), &[1, 2]);
-        assert_eq!(limiter.borrow().current_usage(), 2);
+        assert_eq!(limiter.current_usage(), 2);
 
         arena.append(&[3, 4]).unwrap();
         assert_eq!(arena.bytes(), &[1, 2, 3, 4]);
-        assert_eq!(limiter.borrow().current_usage(), 4);
+        assert_eq!(limiter.current_usage(), 4);
 
         arena.append(&[5, 6, 7, 8, 9, 10]).unwrap();
         assert_eq!(arena.bytes(), &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert_eq!(limiter.borrow().current_usage(), 10);
+        assert_eq!(limiter.current_usage(), 10);
 
         let err = arena.append(&[11]).unwrap_err();
 
@@ -86,24 +85,24 @@ mod tests {
 
     #[test]
     fn init_with() {
-        let limiter = MemoryLimiter::new_shared(5);
-        let mut arena = Arena::new(Rc::clone(&limiter), 0);
+        let limiter = SharedMemoryLimiter::new(5);
+        let mut arena = Arena::new(limiter.clone(), 0);
 
         arena.init_with(&[1]).unwrap();
         assert_eq!(arena.bytes(), &[1]);
-        assert_eq!(limiter.borrow().current_usage(), 1);
+        assert_eq!(limiter.current_usage(), 1);
 
         arena.append(&[1, 2]).unwrap();
         assert_eq!(arena.bytes(), &[1, 1, 2]);
-        assert_eq!(limiter.borrow().current_usage(), 3);
+        assert_eq!(limiter.current_usage(), 3);
 
         arena.init_with(&[1, 2, 3]).unwrap();
         assert_eq!(arena.bytes(), &[1, 2, 3]);
-        assert_eq!(limiter.borrow().current_usage(), 3);
+        assert_eq!(limiter.current_usage(), 3);
 
         arena.init_with(&[]).unwrap();
-        assert_eq!(arena.bytes(), &[]);
-        assert_eq!(limiter.borrow().current_usage(), 3);
+        assert!(arena.bytes().is_empty());
+        assert_eq!(limiter.current_usage(), 3);
 
         let err = arena.init_with(&[1, 2, 3, 4, 5, 6, 7]).unwrap_err();
 
@@ -112,25 +111,25 @@ mod tests {
 
     #[test]
     fn shift() {
-        let limiter = MemoryLimiter::new_shared(10);
-        let mut arena = Arena::new(Rc::clone(&limiter), 0);
+        let limiter = SharedMemoryLimiter::new(10);
+        let mut arena = Arena::new(limiter.clone(), 0);
 
         arena.append(&[0, 1, 2, 3]).unwrap();
         arena.shift(2);
         assert_eq!(arena.bytes(), &[2, 3]);
-        assert_eq!(limiter.borrow().current_usage(), 4);
+        assert_eq!(limiter.current_usage(), 4);
 
         arena.append(&[0, 1]).unwrap();
         assert_eq!(arena.bytes(), &[2, 3, 0, 1]);
-        assert_eq!(limiter.borrow().current_usage(), 4);
+        assert_eq!(limiter.current_usage(), 4);
 
         arena.shift(3);
         assert_eq!(arena.bytes(), &[1]);
-        assert_eq!(limiter.borrow().current_usage(), 4);
+        assert_eq!(limiter.current_usage(), 4);
 
         arena.append(&[2, 3, 4, 5]).unwrap();
         arena.shift(1);
         assert_eq!(arena.bytes(), &[2, 3, 4, 5]);
-        assert_eq!(limiter.borrow().current_usage(), 5);
+        assert_eq!(limiter.current_usage(), 5);
     }
 }

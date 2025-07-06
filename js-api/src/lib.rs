@@ -2,7 +2,6 @@ use lol_html::html_content::ContentType as NativeContentType;
 use std::cell::Cell;
 use std::convert::Into;
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::Drop;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -14,7 +13,8 @@ struct Anchor<'r> {
     lifetime: PhantomData<&'r mut ()>,
 }
 
-impl<'r> Anchor<'r> {
+impl Anchor<'_> {
+    #[inline]
     pub fn new(poisoned: Rc<Cell<bool>>) -> Self {
         Anchor {
             poisoned,
@@ -41,9 +41,9 @@ struct NativeRefWrap<R> {
 }
 
 impl<R> NativeRefWrap<R> {
-    pub fn wrap<I>(inner: &mut I) -> (Self, Anchor) {
-        let wrap = NativeRefWrap {
-            inner_ptr: unsafe { mem::transmute(inner) },
+    pub unsafe fn wrap<I>(inner: &mut I) -> (Self, Anchor) {
+        let wrap = Self {
+            inner_ptr: std::ptr::from_mut::<I>(inner).cast::<R>(),
             poisoned: Rc::new(Cell::new(false)),
         };
 
@@ -147,7 +147,7 @@ macro_rules! impl_mutations {
                 self.0.get_mut().map(|o| o.remove())
             }
 
-            #[wasm_bindgen(method, getter)]
+            #[wasm_bindgen(getter)]
             pub fn removed(&self) -> JsResult<bool> {
                 self.0.get().map(|o| o.removed())
             }
@@ -156,12 +156,12 @@ macro_rules! impl_mutations {
 }
 
 macro_rules! impl_from_native {
-    ($Ty:ident --> $JsTy:ident) => {
+    ($Ty:ty => $JsTy:path) => {
         impl $JsTy {
-            pub(crate) fn from_native<'r>(inner: &'r mut $Ty) -> (Self, Anchor<'r>) {
-                let (ref_wrap, anchor) = NativeRefWrap::wrap(inner);
+            pub(crate) fn with_native<'r, R>(inner: &'r mut $Ty, callback: impl FnOnce(&JsValue) -> R) -> R {
+                let (ref_wrap, _anchor) = unsafe { NativeRefWrap::wrap(inner) };
 
-                ($JsTy(ref_wrap), anchor)
+                (callback)(&JsValue::from($JsTy(ref_wrap)))
             }
         }
     };
@@ -171,5 +171,7 @@ mod comment;
 mod doctype;
 mod document_end;
 mod element;
+mod end_tag;
+mod handlers;
 mod html_rewriter;
 mod text_chunk;

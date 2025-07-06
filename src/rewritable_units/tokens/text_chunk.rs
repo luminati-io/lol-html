@@ -1,12 +1,19 @@
-use super::{Mutations, Token};
-use crate::base::Bytes;
+use super::Mutations;
+use crate::base::SourceLocation;
+use crate::errors::RewritingError;
 use crate::html::TextType;
+use crate::html_content::{ContentType, StreamingHandler, StreamingHandlerSink};
+use crate::rewritable_units::StringChunk;
 use encoding_rs::Encoding;
 use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::{self, Debug};
 
-/// An HTML text node chunk.
+/// A fragment of an HTML text node. Beware: this is tricky to use.
+///
+/// ## The text is fragmented
+///
+/// The text chunks are **not** complete text DOM nodes. They are fragments of text nodes, split at arbitrary points.
 ///
 /// Since the rewriter operates on a streaming input with minimal internal buffering, HTML
 /// text node can be represented by multiple text chunks. The size of a chunk depends on multiple
@@ -21,6 +28,14 @@ use std::fmt::{self, Debug};
 /// produce one text chunk where [`last_in_text_node`] returns `true`. The last chunk in a text
 /// node can have empty textual content. To perform an action once on the text contents of an
 /// element, see [`Element::end_tag_handlers`][crate::rewritable_units::Element::end_tag_handlers].
+///
+/// ## The text may contain entities
+///
+/// Text chunks are passed through as-is, without unescaping. The text may contain HTML entities, potentially
+/// split across chunk boundaries. Text chunks may also appear inside `<style>` or `<script>`,
+/// which do not support HTML entities.
+///
+/// It is important to observe [`TextChunk::text_type`] and unescape/escape the chunks accordingly.
 ///
 /// # Example
 /// ```
@@ -42,7 +57,7 @@ use std::fmt::{self, Debug};
 ///                     Ok(())
 ///                 })
 ///             ],
-///             ..Settings::default()
+///             ..Settings::new()
 ///         },
 ///         |_:&[u8]| {}
 ///     );
@@ -64,39 +79,64 @@ pub struct TextChunk<'i> {
     encoding: &'static Encoding,
     mutations: Mutations,
     user_data: Box<dyn Any>,
+    source_location: SourceLocation,
 }
 
 impl<'i> TextChunk<'i> {
-    pub(super) fn new_token(
+    #[inline]
+    #[must_use]
+    pub(crate) fn new(
         text: &'i str,
         text_type: TextType,
         last_in_text_node: bool,
         encoding: &'static Encoding,
-    ) -> Token<'i> {
-        Token::TextChunk(TextChunk {
+        source_location: SourceLocation,
+    ) -> Self {
+        TextChunk {
             text: text.into(),
             text_type,
             last_in_text_node,
             encoding,
-            mutations: Mutations::new(encoding),
+            mutations: Mutations::new(),
             user_data: Box::new(()),
-        })
+            source_location,
+        }
     }
 
-    /// Returns the textual content of the chunk.
+    #[inline(always)]
+    pub(crate) fn encoding(&self) -> &'static Encoding {
+        self.encoding
+    }
+
+    /// Returns the content of the chunk, which [`may not be a complete text node`](TextChunk).
+    ///
+    /// It may contain markup, such as HTML/XML entities. See [`TextChunk::text_type`].
+    ///
+    /// Because the text may be fragmented and contain markup, operating on the slice directly is tricky.
+    /// It may be necessary to buffer the text. See [`TextChunk::last_in_text_node`].
     #[inline]
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
     }
 
-    /// Returns the textual content of the chunk that the caller can modify.  Note that this can
-    /// cause the string to be allocated.
+    /// Returns the content of the chunk, which [`may not be a complete text node`](TextChunk).
+    ///
+    /// It may contain markup, such as HTML/XML entities. See [`TextChunk::text_type`].
+    ///
+    /// The string may be mutated, but needs to have markup escaped appropriately for the context its in.
+    ///
+    /// Because the text may be fragmented and contain markup, operating on the slice directly is tricky.
+    /// It may be necessary to buffer the text. See [`TextChunk::last_in_text_node`].
     #[inline]
     pub fn as_mut_str(&mut self) -> &mut String {
         self.text.to_mut()
     }
 
-    /// Sets the textual content of the chunk.
+    /// Sets the content of this chunk only, without affecting text chunks around it.
+    ///
+    /// The markup must contain escaping appropriate for the context it's in, e.g. use `&amp` instead of `&` in HTML body.
+    /// See [`TextChunk::text_type`].
     #[inline]
     pub fn set_str(&mut self, text: String) {
         self.text = Cow::Owned(text);
@@ -131,11 +171,12 @@ impl<'i> TextChunk<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     /// ```
     #[inline]
+    #[must_use]
     pub fn text_type(&self) -> TextType {
         self.text_type
     }
@@ -143,7 +184,12 @@ impl<'i> TextChunk<'i> {
     /// Returns `true` if the chunk is last in a HTML text node.
     ///
     /// Note that last chunk can have empty textual content.
+    ///
+    /// In the current implementation, text nodes are interrupted by comments and CDATA.
+    /// Use [`Element::end_tag_handlers`][crate::rewritable_units::Element::end_tag_handlers] to add content after all text in an element.
     #[inline]
+    #[must_use]
+    #[doc(alias = "is_last")]
     pub fn last_in_text_node(&self) -> bool {
         self.last_in_text_node
     }
@@ -171,15 +217,18 @@ impl<'i> TextChunk<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
     /// assert_eq!(html, r#"<div><!-- 42 -->Hello world</div>"#);
     /// ```
     #[inline]
-    pub fn before(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.before(content, content_type);
+    pub fn before(&mut self, content: &str, content_type: ContentType) {
+        self.mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::from_str(content, content_type));
     }
 
     /// Inserts `content` after the text chunk.
@@ -205,15 +254,18 @@ impl<'i> TextChunk<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
     /// assert_eq!(html, r#"<div>FooQuxBar</div>"#);
     /// ```
     #[inline]
-    pub fn after(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.after(content, content_type);
+    pub fn after(&mut self, content: &str, content_type: ContentType) {
+        self.mutations
+            .mutate()
+            .content_after
+            .push_front(StringChunk::from_str(content, content_type));
     }
 
     /// Replaces the text chunk with the `content`.
@@ -239,39 +291,80 @@ impl<'i> TextChunk<'i> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
     /// assert_eq!(html, r#"<div>Qux</div>"#);
     /// ```
     #[inline]
-    pub fn replace(&mut self, content: &str, content_type: crate::rewritable_units::ContentType) {
-        self.mutations.replace(content, content_type);
+    pub fn replace(&mut self, content: &str, content_type: ContentType) {
+        self.mutations
+            .mutate()
+            .replace(StringChunk::from_str(content, content_type));
+    }
+
+    /// Inserts content from a [`StreamingHandler`] before the text chunk.
+    ///
+    /// Consequent calls to the method append `content` to the previously inserted content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_before(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::stream(string_writer));
+    }
+
+    /// Inserts content from a [`StreamingHandler`] after the text chunk.
+    ///
+    /// Consequent calls to the method prepend to the previously inserted content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_after(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .content_after
+            .push_front(StringChunk::stream(string_writer));
+    }
+
+    /// Replaces the text chunk with the content from a [`StreamingHandler`].
+    ///
+    /// Consequent calls to the method overwrite previous replacement content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_replace(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.mutations
+            .mutate()
+            .replace(StringChunk::stream(string_writer));
     }
 
     /// Removes the text chunk.
     #[inline]
     pub fn remove(&mut self) {
-        self.mutations.remove();
+        self.mutations.mutate().remove();
     }
 
     /// Returns `true` if the text chunk has been replaced or removed.
     #[inline]
+    #[must_use]
     pub fn removed(&self) -> bool {
         self.mutations.removed()
     }
 
     #[inline]
-    fn raw(&self) -> Option<&Bytes> {
-        None
+    fn serialize_self(&self, sink: &mut StreamingHandlerSink<'_>) -> Result<(), RewritingError> {
+        if !self.text.is_empty() {
+            // The "text" here is actually markup
+            sink.write_str(&self.text, ContentType::Html);
+        }
+        Ok(())
     }
 
-    #[inline]
-    fn serialize_from_parts(&self, output_handler: &mut dyn FnMut(&[u8])) {
-        if !self.text.is_empty() {
-            output_handler(&Bytes::from_str(&self.text, self.encoding));
-        }
+    /// Position of this text fragment in the source document, before any rewriting
+    #[must_use]
+    pub fn source_location(&self) -> SourceLocation {
+        self.source_location.clone()
     }
 }
 
@@ -279,10 +372,12 @@ impl_serialize!(TextChunk);
 impl_user_data!(TextChunk<'_>);
 
 impl Debug for TextChunk<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextChunk")
             .field("text", &self.as_str())
             .field("last_in_text_node", &self.last_in_text_node())
+            .field("at", &self.source_location())
             .finish()
     }
 }
@@ -297,7 +392,7 @@ mod tests {
     fn rewrite_text_chunk(
         html: &[u8],
         encoding: &'static Encoding,
-        mut handler: impl FnMut(&mut TextChunk),
+        mut handler: impl FnMut(&mut TextChunk<'_>),
     ) -> String {
         let mut handler_called = false;
 
@@ -332,14 +427,14 @@ mod tests {
 
     #[test]
     fn in_place_text_modifications() {
-        use super::super::Token;
-
-        let encoding = Encoding::for_label_no_replacement("utf-8".as_bytes()).unwrap();
-        let Token::TextChunk(mut chunk) =
-            TextChunk::new_token("original text", TextType::PlainText, true, encoding)
-        else {
-            unreachable!()
-        };
+        let encoding = Encoding::for_label_no_replacement(b"utf-8").unwrap();
+        let mut chunk = TextChunk::new(
+            "original text",
+            TextType::PlainText,
+            true,
+            encoding,
+            SourceLocation::from_start_len(0, 0),
+        );
 
         assert_eq!(chunk.as_str(), "original text");
         chunk.set_str("hello".to_owned());
@@ -364,15 +459,6 @@ mod tests {
             };
         }
 
-        macro_rules! skip_eof_chunk {
-            ($c:ident) => {
-                if $c.last_in_text_node() {
-                    assert!($c.as_str().is_empty());
-                    return;
-                }
-            };
-        }
-
         #[test]
         fn parsed() {
             test!(|_| {}, HTML);
@@ -380,15 +466,20 @@ mod tests {
 
         #[test]
         fn with_prepends_and_appends() {
+            let mut first = true;
             test!(
                 |c| {
-                    skip_eof_chunk!(c);
-                    c.before("<span>", ContentType::Text);
-                    c.before("<div>Hey</div>", ContentType::Html);
-                    c.before("<foo>", ContentType::Html);
-                    c.after("</foo>", ContentType::Html);
-                    c.after("<!-- 42 -->", ContentType::Html);
-                    c.after("<foo & bar>", ContentType::Text);
+                    let is_first = std::mem::replace(&mut first, c.last_in_text_node());
+                    if is_first {
+                        c.before("<span>", ContentType::Text);
+                        c.before("<div>Hey</div>", ContentType::Html);
+                        c.before("<foo>", ContentType::Html);
+                    }
+                    if c.last_in_text_node() {
+                        c.after("</foo>", ContentType::Html);
+                        c.after("<!-- 42 -->", ContentType::Html);
+                        c.after("<foo & bar>", ContentType::Text);
+                    }
                 },
                 concat!(
                     "&lt;span&gt;<div>Hey</div><foo>",
@@ -403,17 +494,22 @@ mod tests {
 
         #[test]
         fn removed() {
+            let mut first = true;
             test!(
                 |c| {
-                    skip_eof_chunk!(c);
+                    let is_first = std::mem::replace(&mut first, c.last_in_text_node());
                     assert!(!c.removed());
 
                     c.remove();
 
                     assert!(c.removed());
 
-                    c.before("<before>", ContentType::Html);
-                    c.after("<after>", ContentType::Html);
+                    if is_first {
+                        c.before("<before>", ContentType::Html);
+                    }
+                    if c.last_in_text_node() {
+                        c.after("<after>", ContentType::Html);
+                    }
                 },
                 "<before><after>"
             );
@@ -423,17 +519,20 @@ mod tests {
         fn replaced_with_text() {
             test!(
                 |c| {
-                    skip_eof_chunk!(c);
-                    c.before("<before>", ContentType::Html);
-                    c.after("<after>", ContentType::Html);
+                    if c.last_in_text_node() {
+                        c.before("<before>", ContentType::Html);
+                        c.after("<after>", ContentType::Html);
 
-                    assert!(!c.removed());
+                        assert!(!c.removed());
 
-                    c.replace("<div></div>", ContentType::Html);
-                    c.replace("<!--42-->", ContentType::Html);
-                    c.replace("<foo & bar>", ContentType::Text);
+                        c.replace("<div></div>", ContentType::Html);
+                        c.replace("<!--42-->", ContentType::Html);
+                        c.replace("<foo & bar>", ContentType::Text);
 
-                    assert!(c.removed());
+                        assert!(c.removed());
+                    } else {
+                        c.remove();
+                    }
                 },
                 "<before>&lt;foo &amp; bar&gt;<after>"
             );
@@ -443,20 +542,33 @@ mod tests {
         fn replaced_with_html() {
             test!(
                 |c| {
-                    skip_eof_chunk!(c);
-                    c.before("<before>", ContentType::Html);
-                    c.after("<after>", ContentType::Html);
+                    if c.last_in_text_node() {
+                        c.before("<before>", ContentType::Html);
+                        c.after("<after>", ContentType::Html);
 
-                    assert!(!c.removed());
+                        assert!(!c.removed());
 
-                    c.replace("<div></div>", ContentType::Html);
-                    c.replace("<!--42-->", ContentType::Html);
-                    c.replace("<foo & bar>", ContentType::Html);
+                        c.replace("<div></div>", ContentType::Html);
+                        c.replace("<!--42-->", ContentType::Html);
+                        c.replace("<foo & bar>", ContentType::Html);
 
-                    assert!(c.removed());
+                        assert!(c.removed());
+                    } else {
+                        c.remove();
+                    }
                 },
                 "<before><foo & bar><after>"
             );
+        }
+
+        #[test]
+        fn last_flush_text_decoder() {
+            let rewritten = rewrite_text_chunk(b"<p>\xF0\xF0\x9F\xF0\x9F\x98</p>", UTF_8, |c| {
+                if c.last_in_text_node() {
+                    c.after(" last", ContentType::Text);
+                }
+            });
+            assert_eq!("<p>\u{fffd}\u{fffd}\u{fffd} last</p>", rewritten);
         }
     }
 }

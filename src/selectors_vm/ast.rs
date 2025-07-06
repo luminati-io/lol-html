@@ -1,29 +1,25 @@
 use super::parser::{Selector, SelectorImplDescriptor};
 use hashbrown::HashSet;
 use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
-use selectors::parser::{Combinator, Component};
+use selectors::parser::{Combinator, Component, NthType};
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
-pub struct NthChild {
+pub(crate) struct NthChild {
     step: i32,
     offset: i32,
 }
 
 impl NthChild {
-    /// A first child with a step of 0 and an offset of 1
     #[inline]
-    pub fn first() -> Self {
-        Self::new(0, 1)
-    }
-
-    #[inline]
-    pub fn new(step: i32, offset: i32) -> Self {
+    #[must_use]
+    pub const fn new(step: i32, offset: i32) -> Self {
         Self { step, offset }
     }
 
-    pub fn has_index(self, index: i32) -> bool {
+    #[must_use]
+    pub const fn has_index(self, index: i32) -> bool {
         let Self { offset, step } = self;
         // wrap to prevent panic/abort. we won't wrap around anyway, even with a
         // max offset value (i32::MAX) since index is always more than 0
@@ -43,27 +39,28 @@ impl NthChild {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub enum OnTagNameExpr {
+pub(crate) enum OnTagNameExpr {
     ExplicitAny,
     Unmatchable,
-    LocalName(String),
+    LocalName(Box<str>),
     NthChild(NthChild),
     NthOfType(NthChild),
 }
 
 #[derive(Eq, PartialEq)]
-pub struct AttributeComparisonExpr {
-    pub name: String,
-    pub value: String,
+pub(crate) struct AttributeComparisonExpr {
+    pub name: Box<str>,
+    pub value: Box<str>,
     pub case_sensitivity: ParsedCaseSensitivity,
     pub operator: AttrSelectorOperator,
 }
 
 impl AttributeComparisonExpr {
     #[inline]
-    pub fn new(
-        name: String,
-        value: String,
+    #[must_use]
+    pub const fn new(
+        name: Box<str>,
+        value: Box<str>,
         case_sensitivity: ParsedCaseSensitivity,
         operator: AttrSelectorOperator,
     ) -> Self {
@@ -77,6 +74,7 @@ impl AttributeComparisonExpr {
 }
 
 impl Debug for AttributeComparisonExpr {
+    #[cold]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AttributeExpr")
             .field("name", &self.name)
@@ -99,10 +97,10 @@ impl Debug for AttributeComparisonExpr {
 
 /// An attribute check when attributes are received and parsed.
 #[derive(PartialEq, Eq, Debug)]
-pub enum OnAttributesExpr {
-    Id(String),
-    Class(String),
-    AttributeExists(String),
+pub(crate) enum OnAttributesExpr {
+    Id(Box<str>),
+    Class(Box<str>),
+    AttributeExists(Box<str>),
     AttributeComparisonExpr(AttributeComparisonExpr),
 }
 
@@ -115,66 +113,52 @@ enum Condition {
 }
 
 impl From<&Component<SelectorImplDescriptor>> for Condition {
-    #[inline]
     fn from(component: &Component<SelectorImplDescriptor>) -> Self {
         match component {
             Component::LocalName(n) => {
-                Condition::OnTagName(OnTagNameExpr::LocalName(n.name.to_owned()))
+                Self::OnTagName(OnTagNameExpr::LocalName(n.name.to_boxed_slice()))
             }
             Component::ExplicitUniversalType | Component::ExplicitAnyNamespace => {
-                Condition::OnTagName(OnTagNameExpr::ExplicitAny)
+                Self::OnTagName(OnTagNameExpr::ExplicitAny)
             }
-            Component::ExplicitNoNamespace => Condition::OnTagName(OnTagNameExpr::Unmatchable),
-            Component::ID(id) => Condition::OnAttributes(OnAttributesExpr::Id(id.to_owned())),
-            Component::Class(c) => Condition::OnAttributes(OnAttributesExpr::Class(c.to_owned())),
-            Component::AttributeInNoNamespaceExists { local_name, .. } => {
-                Condition::OnAttributes(OnAttributesExpr::AttributeExists(local_name.to_owned()))
-            }
+            Component::ExplicitNoNamespace => Self::OnTagName(OnTagNameExpr::Unmatchable),
+            Component::ID(id) => Self::OnAttributes(OnAttributesExpr::Id(id.to_boxed_slice())),
+            Component::Class(c) => Self::OnAttributes(OnAttributesExpr::Class(c.to_boxed_slice())),
+            Component::AttributeInNoNamespaceExists { local_name, .. } => Self::OnAttributes(
+                OnAttributesExpr::AttributeExists(local_name.to_boxed_slice()),
+            ),
             &Component::AttributeInNoNamespace {
                 ref local_name,
                 ref value,
                 operator,
                 case_sensitivity,
-                never_matches,
-            } => {
-                if never_matches {
-                    Condition::OnTagName(OnTagNameExpr::Unmatchable)
-                } else {
-                    Condition::OnAttributes(OnAttributesExpr::AttributeComparisonExpr(
-                        AttributeComparisonExpr::new(
-                            local_name.to_owned(),
-                            value.to_owned(),
-                            case_sensitivity,
-                            operator,
-                        ),
-                    ))
-                }
+            } => Self::OnAttributes(OnAttributesExpr::AttributeComparisonExpr(
+                AttributeComparisonExpr::new(
+                    local_name.to_boxed_slice(),
+                    value.to_boxed_slice(),
+                    case_sensitivity,
+                    operator,
+                ),
+            )),
+            Component::Nth(data) if data.ty == NthType::Child => {
+                Self::OnTagName(OnTagNameExpr::NthChild(NthChild::new(data.a, data.b)))
             }
-            Component::FirstChild => {
-                Condition::OnTagName(OnTagNameExpr::NthChild(NthChild::first()))
-            }
-            &Component::NthChild(a, b) => {
-                Condition::OnTagName(OnTagNameExpr::NthChild(NthChild::new(a, b)))
-            }
-            Component::FirstOfType => {
-                Condition::OnTagName(OnTagNameExpr::NthOfType(NthChild::first()))
-            }
-            &Component::NthOfType(a, b) => {
-                Condition::OnTagName(OnTagNameExpr::NthOfType(NthChild::new(a, b)))
+            Component::Nth(data) if data.ty == NthType::OfType => {
+                Self::OnTagName(OnTagNameExpr::NthOfType(NthChild::new(data.a, data.b)))
             }
             // NOTE: the rest of the components are explicit namespace or
             // pseudo class-related. Ideally none of them should appear in
             // the parsed selector as we should bail earlier in the parser.
             // Otherwise, we'll have AST in invalid state in case of error.
-            _ => unreachable!(
-                "Unsupported selector components should be filtered out by the parser."
+            bad_selector => unreachable!(
+                "Unsupported selector components should be filtered out by the parser: {bad_selector:?}"
             ),
         }
     }
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct Expr<E>
+pub(crate) struct Expr<E>
 where
     E: PartialEq + Eq + Debug,
 {
@@ -187,8 +171,8 @@ where
     E: PartialEq + Eq + Debug,
 {
     #[inline]
-    fn new(simple_expr: E, negation: bool) -> Self {
-        Expr {
+    const fn new(simple_expr: E, negation: bool) -> Self {
+        Self {
             simple_expr,
             negation,
         }
@@ -196,7 +180,7 @@ where
 }
 
 #[derive(PartialEq, Eq, Debug, Default)]
-pub struct Predicate {
+pub(crate) struct Predicate {
     pub on_tag_name_exprs: Vec<Expr<OnTagNameExpr>>,
     pub on_attr_exprs: Vec<Expr<OnAttributesExpr>>,
 }
@@ -206,7 +190,7 @@ fn add_expr_to_list<E>(list: &mut Vec<Expr<E>>, expr: E, negation: bool)
 where
     E: PartialEq + Eq + Debug,
 {
-    list.push(Expr::new(expr, negation))
+    list.push(Expr::new(expr, negation));
 }
 
 impl Predicate {
@@ -220,7 +204,7 @@ impl Predicate {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct AstNode<P>
+pub(crate) struct AstNode<P>
 where
     P: Hash + Eq,
 {
@@ -235,7 +219,7 @@ where
     P: Hash + Eq,
 {
     fn new(predicate: Predicate) -> Self {
-        AstNode {
+        Self {
             predicate,
             children: Vec::default(),
             descendants: Vec::default(),
@@ -244,14 +228,15 @@ where
     }
 }
 
+// exposed for selectors_ast tool
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct Ast<P>
 where
     P: PartialEq + Eq + Copy + Debug + Hash,
 {
-    pub root: Vec<AstNode<P>>,
+    pub(crate) root: Vec<AstNode<P>>,
     // NOTE: used to preallocate instruction vector during compilation.
-    pub cumulative_node_count: usize,
+    pub(crate) cumulative_node_count: usize,
 }
 
 impl<P> Ast<P>
@@ -264,23 +249,21 @@ where
         branches: &mut Vec<AstNode<P>>,
         cumulative_node_count: &mut usize,
     ) -> usize {
-        match branches
+        branches
             .iter()
             .enumerate()
             .find(|(_, n)| n.predicate == predicate)
-        {
-            Some((i, _)) => i,
-            None => {
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
                 branches.push(AstNode::new(predicate));
                 *cumulative_node_count += 1;
 
                 branches.len() - 1
-            }
-        }
+            })
     }
 
     pub fn add_selector(&mut self, selector: &Selector, payload: P) {
-        for selector_item in &(selector.0).0 {
+        for selector_item in (selector.0).slice() {
             let mut predicate = Predicate::default();
             let mut branches = &mut self.root;
 
@@ -299,15 +282,16 @@ where
 
             for component in selector_item.iter_raw_parse_order_from(0) {
                 match component {
-                    Component::Combinator(c) => match c {
-                        Combinator::Child => host_and_switch_branch_vec!(children),
-                        Combinator::Descendant => host_and_switch_branch_vec!(descendants),
-                        _ => unreachable!(
-                            "Unsupported selector components should be filtered out by the parser."
-                        ),
-                    },
-                    Component::Negation(c) => {
-                        c.iter().for_each(|c| predicate.add_component(c, true))
+                    Component::Combinator(Combinator::Child) => {
+                        host_and_switch_branch_vec!(children);
+                    }
+                    Component::Combinator(Combinator::Descendant) => {
+                        host_and_switch_branch_vec!(descendants);
+                    }
+                    Component::Negation(ss) => {
+                        ss.slice()
+                            .iter()
+                            .for_each(|s| s.iter().for_each(|c| predicate.add_component(c, true)));
                     }
                     _ => predicate.add_component(component, false),
                 }
@@ -332,6 +316,7 @@ mod tests {
         };
     }
 
+    #[track_caller]
     fn assert_ast(selectors: &[&str], expected: Ast<usize>) {
         let mut ast = Ast::default();
 
@@ -342,13 +327,14 @@ mod tests {
         assert_eq!(ast, expected);
     }
 
+    #[track_caller]
     fn assert_err(selector: &str, expected_err: SelectorError) {
         assert_eq!(selector.parse::<Selector>().unwrap_err(), expected_err);
     }
 
     #[test]
     fn simple_non_attr_expression() {
-        vec![
+        for (selector, expected) in [
             (
                 "*",
                 Expr {
@@ -364,22 +350,13 @@ mod tests {
                 },
             ),
             (
-                r#"[foo*=""]"#,
-                Expr {
-                    simple_expr: OnTagNameExpr::Unmatchable,
-                    negation: false,
-                },
-            ),
-            (
                 ":not(div)",
                 Expr {
                     simple_expr: OnTagNameExpr::LocalName("div".into()),
                     negation: true,
                 },
             ),
-        ]
-        .into_iter()
-        .for_each(|(selector, expected)| {
+        ] {
             assert_ast(
                 &[selector],
                 Ast {
@@ -395,12 +372,12 @@ mod tests {
                     cumulative_node_count: 1,
                 },
             );
-        });
+        }
     }
 
     #[test]
     fn simple_attr_expression() {
-        vec![
+        for (selector, expected) in [
             (
                 "#foo",
                 Expr {
@@ -431,6 +408,20 @@ mod tests {
                             value: "bar".into(),
                             case_sensitivity: ParsedCaseSensitivity::CaseSensitive,
                             operator: AttrSelectorOperator::Equal,
+                        },
+                    ),
+                    negation: false,
+                },
+            ),
+            (
+                r#"[foo*=""]"#,
+                Expr {
+                    simple_expr: OnAttributesExpr::AttributeComparisonExpr(
+                        AttributeComparisonExpr {
+                            name: "foo".into(),
+                            value: "".into(),
+                            case_sensitivity: ParsedCaseSensitivity::CaseSensitive,
+                            operator: AttrSelectorOperator::Substring,
                         },
                     ),
                     negation: false,
@@ -520,9 +511,7 @@ mod tests {
                     negation: true,
                 },
             ),
-        ]
-        .into_iter()
-        .for_each(|(selector, expected)| {
+        ] {
             assert_ast(
                 &[selector],
                 Ast {
@@ -538,7 +527,7 @@ mod tests {
                     cumulative_node_count: 1,
                 },
             );
-        });
+        }
     }
 
     #[test]
@@ -666,7 +655,7 @@ mod tests {
                 }],
                 cumulative_node_count: 5,
             },
-        )
+        );
     }
 
     #[test]
@@ -824,17 +813,17 @@ mod tests {
             r#"div[foo~"bar"]"#,
             SelectorError::UnexpectedTokenInAttribute,
         );
-        assert_err(":not(:not(p))", SelectorError::NestedNegation);
         assert_err("svg|img", SelectorError::NamespacedSelector);
         assert_err(".foo()", SelectorError::InvalidClassName);
-        assert_err(":not()", SelectorError::EmptyNegation);
+        assert_err(":not()", SelectorError::EmptySelector);
         assert_err("div + span", SelectorError::UnsupportedCombinator('+'));
         assert_err("div ~ span", SelectorError::UnsupportedCombinator('~'));
+        assert_err(":nth-child(n of a)", SelectorError::UnexpectedToken);
     }
 
     #[test]
     fn pseudo_class_parse_errors() {
-        [
+        for s in &[
             ":active",
             ":any-link",
             ":blank",
@@ -890,14 +879,14 @@ mod tests {
             ":valid",
             ":visited",
             ":where(p)",
-        ]
-        .iter()
-        .for_each(|s| assert_err(s, SelectorError::UnsupportedPseudoClassOrElement));
+        ] {
+            assert_err(s, SelectorError::UnsupportedPseudoClassOrElement);
+        }
     }
 
     #[test]
     fn pseudo_elements_parse_errors() {
-        [
+        for s in &[
             "::after",
             "::backdrop",
             "::before",
@@ -910,9 +899,9 @@ mod tests {
             "::selection",
             "::slotted()",
             "::spelling-error",
-        ]
-        .iter()
-        .for_each(|s| assert_err(s, SelectorError::UnsupportedPseudoClassOrElement));
+        ] {
+            assert_err(s, SelectorError::UnsupportedPseudoClassOrElement);
+        }
     }
 
     #[test]
@@ -934,7 +923,7 @@ mod tests {
         assert!(!odd.has_index(2));
         assert!(odd.has_index(3));
 
-        let first = NthChild::first();
+        let first = NthChild::new(0, 1);
         assert!(first.has_index(1));
         assert!(!first.has_index(2));
         assert!(!first.has_index(3));

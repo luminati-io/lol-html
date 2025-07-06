@@ -1,8 +1,7 @@
-use cc;
 use glob::glob;
 use std::path::{Path, PathBuf};
 
-const CFLAGS: &'static [&str] = &[
+const CFLAGS: &[&str] = &[
     "-std=c99",
     "-pthread",
     "-Wcast-qual",
@@ -40,7 +39,7 @@ fn glob_c_files<P: AsRef<Path>>(dirname: P) -> Vec<PathBuf> {
             .unwrap_or(path)
             .to_str()
             .expect("non-ascii C source file");
-        println!("cargo:rerun-if-changed={}", relative_path);
+        println!("cargo:rerun-if-changed={relative_path}");
     })
     .collect::<Vec<_>>()
 }
@@ -53,6 +52,8 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=../include/lol_html.h");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=build.rs");
 
     // Collect all the C files from src/deps/picotest and src.
     let mut c_files = glob_c_files(PICOTEST_DIR);
@@ -62,7 +63,6 @@ fn main() {
     build
         .debug(true)
         .opt_level(0)
-        .flag_if_supported("-Wl,no-as-needed")
         .warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true)
@@ -70,7 +70,4 @@ fn main() {
         .include(PICOTEST_DIR)
         .files(c_files)
         .compile("lol_html_ctests");
-
-    // Link against the C API.
-    println!("cargo:rustc-link-lib=dylib=lolhtml");
 }

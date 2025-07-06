@@ -2,11 +2,8 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-extern crate encoding_rs;
-extern crate lol_html;
-extern crate rand;
-
-extern crate libc;
+// make it link
+use lolhtml as _;
 
 use libc::{c_char, c_void, size_t};
 use rand::Rng;
@@ -14,9 +11,8 @@ use std::ffi::{CStr, CString};
 
 use encoding_rs::*;
 use lol_html::html_content::ContentType;
-use lol_html::{
-    comments, doc_comments, doc_text, element, text, HtmlRewriter, MemorySettings, Settings,
-};
+use lol_html::{comments, doc_comments, doc_text, element, streaming, text};
+use lol_html::{HtmlRewriter, MemorySettings, Settings};
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -78,9 +74,9 @@ static SUPPORTED_SELECTORS: [&str; 16] = [
     "p > a",
 ];
 
-extern "C" fn empty_handler(_foo: *const c_char, _size: size_t, _boo: *mut c_void) -> () {}
+extern "C" fn empty_handler(_foo: *const c_char, _size: size_t, _boo: *mut c_void) {}
 
-pub fn run_rewriter(data: &[u8]) -> () {
+pub fn run_rewriter(data: &[u8]) {
     // fuzzing with randomly picked selector and encoding
     // works much faster (50 times) that iterating over all
     // selectors/encoding per single run. It's recommended
@@ -88,61 +84,60 @@ pub fn run_rewriter(data: &[u8]) -> () {
     run_rewriter_iter(data, get_random_selector(), get_random_encoding());
 }
 
-pub fn run_c_api_rewriter(data: &[u8]) -> () {
+pub fn run_c_api_rewriter(data: &[u8]) {
     run_c_api_rewriter_iter(data, get_random_encoding().name());
 }
 
 fn get_random_encoding() -> &'static Encoding {
     let random_encoding_index = rand::thread_rng().gen_range(0..ASCII_COMPATIBLE_ENCODINGS.len());
-    return ASCII_COMPATIBLE_ENCODINGS[random_encoding_index];
+    ASCII_COMPATIBLE_ENCODINGS[random_encoding_index]
 }
 
 fn get_random_selector() -> &'static str {
     let random_selector_index = rand::thread_rng().gen_range(0..SUPPORTED_SELECTORS.len());
-    return SUPPORTED_SELECTORS[random_selector_index];
+    SUPPORTED_SELECTORS[random_selector_index]
 }
 
-fn run_rewriter_iter(data: &[u8], selector: &str, encoding: &'static Encoding) -> () {
-    let mut rewriter = HtmlRewriter::new(
+fn run_rewriter_iter(data: &[u8], selector: &str, encoding: &'static Encoding) {
+    let mut rewriter: HtmlRewriter<_> = HtmlRewriter::new(
         Settings {
             enable_esi_tags: true,
             element_content_handlers: vec![
                 element!(selector, |el| {
                     el.before(
-                        &format!("<!--[ELEMENT('{}')]-->", selector),
+                        &format!("<!--[ELEMENT('{selector}')]-->"),
                         ContentType::Html,
                     );
                     el.after(
-                        &format!("<!--[/ELEMENT('{}')]-->", selector),
+                        &format!("<!--[/ELEMENT('{selector}')]-->"),
                         ContentType::Html,
                     );
-                    el.set_inner_content(
-                        &format!("<!--Replaced ({}) -->", selector),
-                        ContentType::Html,
-                    );
+
+                    let replaced = format!("<!--Replaced ({selector}) -->");
+                    el.streaming_set_inner_content(streaming!(move |sink| {
+                        sink.write_str(&replaced, ContentType::Html);
+                        Ok(())
+                    }));
 
                     Ok(())
                 }),
                 comments!(selector, |c| {
                     c.before(
-                        &format!("<!--[COMMENT('{}')]-->", selector),
+                        &format!("<!--[COMMENT('{selector}')]-->"),
                         ContentType::Html,
                     );
                     c.after(
-                        &format!("<!--[/COMMENT('{}')]-->", selector),
+                        &format!("<!--[/COMMENT('{selector}')]-->"),
                         ContentType::Html,
                     );
 
                     Ok(())
                 }),
                 text!(selector, |t| {
-                    t.before(&format!("<!--[TEXT('{}')]-->", selector), ContentType::Html);
+                    t.before(&format!("<!--[TEXT('{selector}')]-->"), ContentType::Html);
 
                     if t.last_in_text_node() {
-                        t.after(
-                            &format!("<!--[/TEXT('{}')]-->", selector),
-                            ContentType::Html,
-                        );
+                        t.after(&format!("<!--[/TEXT('{selector}')]-->"), ContentType::Html);
                     }
 
                     Ok(())
@@ -165,7 +160,7 @@ fn run_rewriter_iter(data: &[u8], selector: &str, encoding: &'static Encoding) -
             ],
             document_content_handlers: vec![
                 doc_comments!(|c| {
-                    c.set_text(&"123456").unwrap();
+                    c.set_text("123456").unwrap();
 
                     Ok(())
                 }),
@@ -178,7 +173,7 @@ fn run_rewriter_iter(data: &[u8], selector: &str, encoding: &'static Encoding) -
                 }),
             ],
             encoding: encoding.try_into().unwrap(),
-            memory_settings: MemorySettings::default(),
+            memory_settings: MemorySettings::new(),
             strict: false,
             adjust_charset_on_meta_tag: false,
         },
@@ -189,13 +184,13 @@ fn run_rewriter_iter(data: &[u8], selector: &str, encoding: &'static Encoding) -
     rewriter.end().unwrap();
 }
 
-fn run_c_api_rewriter_iter(data: &[u8], encoding: &str) -> () {
+fn run_c_api_rewriter_iter(data: &[u8], encoding: &str) {
     let c_encoding = CString::new(encoding).expect("CString::new failed.");
 
     unsafe {
         let builder = lol_html_rewriter_builder_new();
-        let mut output_data = {};
-        let output_data_ptr: *mut c_void = &mut output_data as *mut _ as *mut c_void;
+        let mut output_data = ();
+        let output_data_ptr: *mut c_void = std::ptr::from_mut(&mut output_data).cast::<c_void>();
 
         let rewriter = lol_html_rewriter_build(
             builder,
@@ -203,7 +198,7 @@ fn run_c_api_rewriter_iter(data: &[u8], encoding: &str) -> () {
             encoding.len(),
             lol_html_memory_settings_t {
                 preallocated_parsing_buffer_size: 0,
-                max_allowed_memory_usage: std::usize::MAX,
+                max_allowed_memory_usage: usize::MAX,
             },
             Some(empty_handler),
             output_data_ptr,

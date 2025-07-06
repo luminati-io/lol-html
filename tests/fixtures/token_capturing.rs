@@ -4,8 +4,9 @@ use lol_html::errors::RewritingError;
 use lol_html::html_content::{DocumentEnd, TextType};
 use lol_html::test_utils::Output;
 use lol_html::{
-    LocalName, LocalNameHash, MemoryLimiter, Namespace, SharedEncoding, StartTagHandlingResult,
-    Token, TokenCaptureFlags, TransformController, TransformStream, TransformStreamSettings,
+    LocalName, LocalNameHash, Namespace, SharedEncoding, SharedMemoryLimiter,
+    StartTagHandlingResult, Token, TokenCaptureFlags, TransformController, TransformStream,
+    TransformStreamSettings,
 };
 
 macro_rules! expect_eql {
@@ -40,7 +41,7 @@ macro_rules! expect {
     };
 }
 
-type TokenHandler<'h> = Box<dyn FnMut(&mut Token) + 'h>;
+type TokenHandler<'h> = Box<dyn FnMut(&mut Token<'_>) + 'h>;
 
 pub struct TestTransformController<'h> {
     token_handler: TokenHandler<'h>,
@@ -60,21 +61,21 @@ impl TransformController for TestTransformController<'_> {
     fn initial_capture_flags(&self) -> TokenCaptureFlags {
         self.capture_flags
     }
-    fn handle_start_tag(&mut self, _: LocalName, _: Namespace) -> StartTagHandlingResult<Self> {
+    fn handle_start_tag(&mut self, _: LocalName<'_>, _: Namespace) -> StartTagHandlingResult<Self> {
         Ok(self.capture_flags)
     }
 
-    fn handle_end_tag(&mut self, _: LocalName) -> TokenCaptureFlags {
+    fn handle_end_tag(&mut self, _: LocalName<'_>) -> TokenCaptureFlags {
         self.capture_flags
     }
 
-    fn handle_token(&mut self, token: &mut Token) -> Result<(), RewritingError> {
+    fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError> {
         (self.token_handler)(token);
 
         Ok(())
     }
 
-    fn handle_end(&mut self, _: &mut DocumentEnd) -> Result<(), RewritingError> {
+    fn handle_end(&mut self, _: &mut DocumentEnd<'_>) -> Result<(), RewritingError> {
         Ok(())
     }
 
@@ -88,7 +89,7 @@ pub fn parse(
     capture_flags: TokenCaptureFlags,
     initial_text_type: TextType,
     last_start_tag_name_hash: LocalNameHash,
-    token_handler: TokenHandler,
+    token_handler: TokenHandler<'_>,
 ) -> Result<String, RewritingError> {
     let encoding = input
         .encoding()
@@ -96,7 +97,7 @@ pub fn parse(
 
     let mut output = Output::new(encoding.into());
     let transform_controller = TestTransformController::new(token_handler, capture_flags);
-    let memory_limiter = MemoryLimiter::new_shared(2048);
+    let memory_limiter = SharedMemoryLimiter::new(2048);
 
     let mut transform_stream = TransformStream::new(TransformStreamSettings {
         transform_controller,
@@ -178,7 +179,7 @@ impl TokenCapturingTests {
             TokenCaptureFlags::empty(),
         ]
         .iter()
-        .cloned()
+        .copied()
         .for_each(|capture_flags| {
             let mut expected_tokens = filter_tokens(&test.expected_tokens, capture_flags);
             let mut token_list = TestTokenList::default();
@@ -258,4 +259,7 @@ impl TestFixture<TestCase> for TokenCapturingTests {
     }
 }
 
-test_fixture!(TokenCapturingTests);
+#[test]
+fn test_token_capturing() {
+    TokenCapturingTests::run_tests();
+}

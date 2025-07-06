@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash};
 
 #[inline]
-fn is_void_element(local_name: &LocalName, enable_esi_tags: bool) -> bool {
+fn is_void_element(local_name: &LocalName<'_>, enable_esi_tags: bool) -> bool {
     // NOTE: fast path for the most commonly used elements
     if tag_is_one_of!(*local_name, [Div, A, Span, Li]) {
         return false;
@@ -42,26 +42,27 @@ fn can_be_void_element(local_name: &LocalName) -> bool {
     tag_is_one_of!(*local_name, [Iframe])
 }
 
-pub trait ElementData: Default + 'static {
+pub(crate) trait ElementData: Default + 'static {
     type MatchPayload: PartialEq + Eq + Copy + Debug + Hash + 'static;
 
     fn matched_payload_mut(&mut self) -> &mut HashSet<Self::MatchPayload>;
 }
 
-pub enum StackDirective {
+pub(crate) enum StackDirective {
     Push,
     PushIfNotSelfClosing,
     PopImmediately,
 }
 
 #[derive(Default)]
-pub struct ChildCounter {
+pub(crate) struct ChildCounter {
     cumulative: i32,
 }
 
 impl ChildCounter {
     #[inline]
-    pub fn new_and_inc() -> Self {
+    #[must_use]
+    pub const fn new_and_inc() -> Self {
         Self { cumulative: 1 }
     }
 
@@ -71,7 +72,8 @@ impl ChildCounter {
     }
 
     #[inline]
-    pub fn is_nth(&self, nth: NthChild) -> bool {
+    #[must_use]
+    pub const fn is_nth(&self, nth: NthChild) -> bool {
         nth.has_index(self.cumulative)
     }
 }
@@ -90,7 +92,7 @@ struct CounterList {
 }
 
 impl CounterList {
-    pub fn new(start: usize) -> Self {
+    pub const fn new(start: usize) -> Self {
         Self {
             items: Vec::new(),
             current: CounterItem {
@@ -103,15 +105,15 @@ impl CounterList {
 
 #[derive(Default)]
 /// A more efficient counter that only requires one owned local name to track counters across multiple stack frames
-pub struct TypedChildCounterMap(HashMap<LocalName<'static>, CounterList>);
+pub(crate) struct TypedChildCounterMap(HashMap<LocalName<'static>, CounterList>);
 
 impl TypedChildCounterMap {
-    fn hash_name(&self, name: &LocalName) -> u64 {
+    fn hash_name(&self, name: &LocalName<'_>) -> u64 {
         self.0.hasher().hash_one(name)
     }
 
     /// Adds a seen child to the map. The index is the level of the item
-    pub fn add_child(&mut self, name: &LocalName, index: usize) {
+    pub fn add_child(&mut self, name: &LocalName<'_>, index: usize) {
         let hash = self.hash_name(name);
         let entry = self.0.raw_entry_mut().from_hash(hash, |n| name == n);
         match entry {
@@ -169,7 +171,7 @@ impl TypedChildCounterMap {
     }
 }
 
-pub struct StackItem<'i, E: ElementData> {
+pub(crate) struct StackItem<'i, E: ElementData> {
     pub local_name: LocalName<'i>,
     pub element_data: E,
     pub jumps: Vec<AddressRange>,
@@ -181,6 +183,7 @@ pub struct StackItem<'i, E: ElementData> {
 
 impl<'i, E: ElementData> StackItem<'i, E> {
     #[inline]
+    #[must_use]
     pub fn new(local_name: LocalName<'i>) -> Self {
         StackItem {
             local_name,
@@ -207,7 +210,7 @@ impl<'i, E: ElementData> StackItem<'i, E> {
     }
 }
 
-pub struct Stack<E: ElementData> {
+pub(crate) struct Stack<E: ElementData> {
     /// A counter for root elements
     root_child_counter: ChildCounter,
     /// A typed counter for all elements on all frames. This is optional to indicate if types are actually being counted.
@@ -216,8 +219,9 @@ pub struct Stack<E: ElementData> {
 }
 
 impl<E: ElementData> Stack<E> {
+    #[must_use]
     pub fn new(memory_limiter: SharedMemoryLimiter, enable_nth_of_type: bool) -> Self {
-        Stack {
+        Self {
             root_child_counter: Default::default(),
             typed_child_counters: if enable_nth_of_type {
                 Some(Default::default())
@@ -241,14 +245,15 @@ impl<E: ElementData> Stack<E> {
         }
     }
 
+    #[must_use]
     pub fn build_state<'a, 'i>(&'a self, name: &LocalName<'i>) -> SelectorState<'i>
     where
         'a: 'i, // 'a outlives 'i, required to downcast 'a lifetimes into 'i
     {
-        let cumulative = match self.items.last() {
-            Some(last) => &last.child_counter,
-            None => &self.root_child_counter,
-        };
+        let cumulative = self
+            .items
+            .last()
+            .map_or(&self.root_child_counter, |last| &last.child_counter);
         SelectorState {
             cumulative,
             typed: self
@@ -259,16 +264,17 @@ impl<E: ElementData> Stack<E> {
     }
 
     #[inline]
+    #[must_use]
     pub fn get_stack_directive(
-        item: &StackItem<E>,
+        item: &StackItem<'_, E>,
         ns: Namespace,
         enable_esi_tags: bool,
     ) -> StackDirective {
         if ns == Namespace::Html {
             if is_void_element(&item.local_name, enable_esi_tags) {
                 StackDirective::PopImmediately
-            } else if can_be_void_element(&item.local_name) {
-                StackDirective::PushIfNotSelfClosing
+            // } else if can_be_void_element(&item.local_name) {
+            //     StackDirective::PushIfNotSelfClosing
             } else {
                 StackDirective::Push
             }
@@ -277,24 +283,29 @@ impl<E: ElementData> Stack<E> {
         }
     }
 
-    pub fn pop_up_to(&mut self, local_name: LocalName, popped_element_data_handler: impl FnMut(E)) {
+    pub fn pop_up_to(
+        &mut self,
+        local_name: LocalName<'_>,
+        popped_element_data_handler: impl FnMut(E),
+    ) {
         let pop_to_index = self
             .items
             .iter()
             .rposition(|item| item.local_name == local_name);
         if let Some(index) = pop_to_index {
             if let Some(c) = self.typed_child_counters.as_mut() {
-                c.pop_to(index)
+                c.pop_to(index);
             }
             self.items
                 .drain(index..)
                 .map(|i| i.element_data)
-                .for_each(popped_element_data_handler)
+                .for_each(popped_element_data_handler);
         }
     }
 
     #[inline]
-    pub fn items(&self) -> &[StackItem<E>] {
+    #[must_use]
+    pub fn items(&self) -> &[StackItem<'_, E>] {
         &self.items
     }
 
@@ -322,7 +333,7 @@ impl<E: ElementData> Stack<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryLimiter;
+    use crate::memory::SharedMemoryLimiter;
     use encoding_rs::UTF_8;
 
     #[derive(Default)]
@@ -351,7 +362,7 @@ mod tests {
     #[test]
     #[allow(clippy::reversed_empty_ranges)]
     fn hereditary_jumps_flag() {
-        let mut stack = Stack::new(MemoryLimiter::new_shared(2048), false);
+        let mut stack = Stack::new(SharedMemoryLimiter::new(2048), false);
 
         stack.push_item(item("item1", 0)).unwrap();
 
@@ -379,7 +390,7 @@ mod tests {
     fn pop_up_to() {
         macro_rules! assert_pop_result {
             ($up_to:expr, $expected_unmatched:expr, $expected_items:expr) => {{
-                let mut stack = Stack::new(MemoryLimiter::new_shared(2048), false);
+                let mut stack = Stack::new(SharedMemoryLimiter::new(2048), false);
 
                 stack.push_item(item("html", 0)).unwrap();
                 stack.push_item(item("body", 1)).unwrap();
@@ -421,7 +432,7 @@ mod tests {
 
     #[test]
     fn pop_up_to_on_empty_stack() {
-        let mut stack = Stack::new(MemoryLimiter::new_shared(2048), false);
+        let mut stack = Stack::new(SharedMemoryLimiter::new(2048), false);
         let mut handler_called = false;
 
         stack.pop_up_to(local_name("div"), |_: TestElementData| {

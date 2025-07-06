@@ -6,7 +6,7 @@
 //!
 //! The crate serves as a back-end for the HTML rewriting functionality of [Cloudflare Workers], but
 //! can be used as a standalone library with the convenient API for a wide variety of HTML
-//! rewriting/analyzis tasks.
+//! rewriting/analysis tasks.
 //!
 //! The crate provides two main API entry points:
 //!
@@ -16,8 +16,13 @@
 //! [Cloudflare Workers]: https://www.cloudflare.com/en-gb/products/cloudflare-workers/
 //! [`HtmlRewriter`]: struct.HtmlRewriter.html
 //! [`rewrite_str`]: fn.rewrite_str.html
-
+#![forbid(unsafe_code)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_pub_crate)]
+#![deny(rustdoc::broken_intra_doc_links)]
 #![cfg_attr(not(any(feature = "integration_test", test)), warn(missing_docs))]
+#![cfg_attr(any(feature = "integration_test", test), allow(unnameable_types))]
 
 #[macro_use]
 mod base;
@@ -37,17 +42,48 @@ use cfg_if::cfg_if;
 
 pub use self::rewriter::{
     rewrite_str, AsciiCompatibleEncoding, CommentHandler, DoctypeHandler, DocumentContentHandlers,
-    ElementContentHandlers, ElementHandler, EndHandler, EndTagHandler, HandlerResult, HtmlRewriter,
-    MemorySettings, RewriteStrSettings, Settings, TextHandler,
+    ElementContentHandlers, ElementHandler, EndHandler, EndTagHandler, HandlerResult, HandlerTypes,
+    HtmlRewriter, LocalHandlerTypes, MemorySettings, RewriteStrSettings, Settings, TextHandler,
 };
 pub use self::selectors_vm::Selector;
 pub use self::transform_stream::OutputSink;
+
+/// This module contains type aliases that make the [`HtmlRewriter`] safe to move between threads (have the [`Send`] bound).
+///
+/// The bound requires content handlers to be thread-safe, which prevents them from mutating external state without synchronization.
+///
+/// Rewriting is sequential, so there's no benefit from using the `Send`-compatible rewriter.
+pub mod send {
+    pub use crate::rewriter::{
+        CommentHandlerSend as CommentHandler, DoctypeHandlerSend as DoctypeHandler,
+        ElementHandlerSend as ElementHandler, EndHandlerSend as EndHandler,
+        EndTagHandlerSend as EndTagHandler, TextHandlerSend as TextHandler,
+    };
+    pub use crate::rewriter::{IntoHandler, SendHandlerTypes};
+
+    /// An [`HtmlRewriter`](crate::HtmlRewriter) that implements [`Send`].
+    pub type HtmlRewriter<'h, O> = crate::HtmlRewriter<'h, O, SendHandlerTypes>;
+    /// [`Settings`](crate::Settings) for [`Send`]able [`HtmlRewriter`](crate::HtmlRewriter)s.
+    pub type Settings<'h, 's> = crate::Settings<'h, 's, SendHandlerTypes>;
+    /// [`RewriteStrSettings`](crate::RewriteStrSettings) for [`Send`]able [`HtmlRewriter`](crate::HtmlRewriter)s.
+    pub type RewriteStrSettings<'h, 's> = crate::RewriteStrSettings<'h, 's, SendHandlerTypes>;
+
+    /// [`ElementContentHandlers`](crate::ElementContentHandlers) for [`Send`]able [`HtmlRewriter`](crate::HtmlRewriter)s.
+    pub type ElementContentHandlers<'h> = crate::ElementContentHandlers<'h, SendHandlerTypes>;
+    /// [`DocumentContentHandlers`](crate::DocumentContentHandlers) for [`Send`]able [`HtmlRewriter`](crate::HtmlRewriter)s.
+    pub type DocumentContentHandlers<'h> = crate::DocumentContentHandlers<'h, SendHandlerTypes>;
+
+    /// [`Element`](crate::rewritable_units::Element) for [`Send`]able [`HtmlRewriter`](crate::HtmlRewriter)s.
+    pub type Element<'r, 't> = crate::rewritable_units::Element<'r, 't, SendHandlerTypes>;
+}
 
 /// The errors that can be produced by the crate's API.
 pub mod errors {
     pub use super::memory::MemoryLimitExceededError;
     pub use super::parser::ParsingAmbiguityError;
-    pub use super::rewritable_units::{AttributeNameError, CommentTextError, TagNameError};
+    pub use super::rewritable_units::{
+        AttributeNameError, CommentTextError, TagNameError, Utf8Error,
+    };
     pub use super::rewriter::RewritingError;
     pub use super::selectors_vm::SelectorError;
 }
@@ -56,9 +92,10 @@ pub mod errors {
 pub mod html_content {
     pub use super::rewritable_units::{
         Attribute, Comment, ContentType, Doctype, DocumentEnd, Element, EndTag, StartTag,
-        TextChunk, UserData,
+        StreamingHandler, StreamingHandlerSink, TextChunk, UserData,
     };
 
+    pub use super::base::SourceLocation;
     pub use super::html::TextType;
 }
 
@@ -105,7 +142,7 @@ pub mod test_utils {
         X_USER_DEFINED,
     ];
 
-    pub static NON_ASCII_COMPATIBLE_ENCODINGS: [&encoding_rs::Encoding; 4] =
+    pub static NON_ASCII_COMPATIBLE_ENCODINGS: [&Encoding; 4] =
         [UTF_16BE, UTF_16LE, ISO_2022_JP, REPLACEMENT];
 
     pub struct Output {
@@ -115,14 +152,18 @@ pub mod test_utils {
     }
 
     impl Output {
+        #[must_use]
+        #[inline]
         pub fn new(encoding: &'static Encoding) -> Self {
-            Output {
+            Self {
                 bytes: Vec::default(),
                 encoding,
                 finalizing_chunk_received: false,
             }
         }
 
+        #[inline]
+        #[track_caller]
         pub fn push(&mut self, chunk: &[u8]) {
             if chunk.is_empty() {
                 self.finalizing_chunk_received = true;
@@ -138,7 +179,9 @@ pub mod test_utils {
     }
 
     impl From<Output> for String {
-        fn from(output: Output) -> String {
+        #[inline]
+        #[track_caller]
+        fn from(output: Output) -> Self {
             assert!(
                 output.finalizing_chunk_received,
                 "Finalizing chunk for the output hasn't been received."
@@ -165,10 +208,10 @@ cfg_if! {
         };
 
         pub use self::rewritable_units::{
-            EndTag, Serialize, StartTag, Token, TokenCaptureFlags, Mutations
+            EndTag, Serialize, StartTag, Token, TokenCaptureFlags,
         };
 
-        pub use self::memory::MemoryLimiter;
+        pub use self::memory::SharedMemoryLimiter;
         pub use self::html::{LocalName, LocalNameHash, Tag, Namespace};
     } else {
         mod selectors_vm;

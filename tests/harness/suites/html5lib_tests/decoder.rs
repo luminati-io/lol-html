@@ -50,7 +50,7 @@ impl<'a> Decoder<'a> {
     }
 
     fn next_opt<T>(&mut self, f: impl Fn(char) -> Option<T>) -> Option<T> {
-        let opt = self.chars.peek().cloned().and_then(f);
+        let opt = self.chars.peek().copied().and_then(f);
         if opt.is_some() {
             self.chars.next();
         }
@@ -91,13 +91,8 @@ impl<'a> Decoder<'a> {
                 self.chars.next();
                 if m.0 != 0 {
                     if c != ';' && self.entities == Entities::Attribute {
-                        if let Some(&c) = self.chars.peek() {
-                            match c {
-                                'A'..='Z' | 'a'..='z' | '0'..='9' | '=' => {
-                                    continue;
-                                }
-                                _ => {}
-                            }
+                        if let Some('A'..='Z' | 'a'..='z' | '0'..='9' | '=') = self.chars.peek() {
+                            continue;
                         }
                     }
                     name_match = (m.0, m.1, name_buf.len());
@@ -142,17 +137,17 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    pub fn unsafe_null(mut self) -> Self {
+    pub const fn unsafe_null(mut self) -> Self {
         self.null = true;
         self
     }
 
-    pub fn text_entities(mut self) -> Self {
+    pub const fn text_entities(mut self) -> Self {
         self.entities = Entities::Text;
         self
     }
 
-    pub fn attr_entities(mut self) -> Self {
+    pub const fn attr_entities(mut self) -> Self {
         self.entities = Entities::Attribute;
         self
     }

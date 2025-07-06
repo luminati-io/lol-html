@@ -1,8 +1,14 @@
 use std::any::Any;
 
+pub(crate) use self::mutations::{Mutations, StringChunk};
+pub(crate) use self::text_decoder::TextDecoder;
+pub(crate) use self::text_encoder::{IncompleteUtf8Resync, TextEncoder};
+
 pub use self::document_end::*;
 pub use self::element::*;
-pub use self::mutations::{ContentType, Mutations};
+pub use self::mutations::{ContentType, StreamingHandler};
+pub use self::streaming_sink::StreamingHandlerSink;
+pub use self::text_encoder::Utf8Error;
 pub use self::tokens::*;
 
 /// Data that can be attached to a rewritable unit by a user and shared between content handler
@@ -44,7 +50,7 @@ pub use self::tokens::*;
 ///                 Ok(())
 ///             })
 ///         ],
-///         ..RewriteStrSettings::default()
+///         ..RewriteStrSettings::new()
 ///     }
 /// ).unwrap();
 /// ```
@@ -83,6 +89,9 @@ mod mutations;
 
 mod document_end;
 mod element;
+mod streaming_sink;
+mod text_decoder;
+mod text_encoder;
 mod tokens;
 
 #[cfg(test)]
@@ -93,7 +102,7 @@ mod test_utils {
     use encoding_rs::Encoding;
     use std::borrow::Cow;
 
-    pub fn encoded(input: &str) -> Vec<(Vec<u8>, &'static Encoding)> {
+    pub(crate) fn encoded(input: &str) -> Vec<(Vec<u8>, &'static Encoding)> {
         ASCII_COMPATIBLE_ENCODINGS
             .iter()
             .filter_map(|enc| {
@@ -115,11 +124,11 @@ mod test_utils {
             .collect()
     }
 
-    pub fn rewrite_html(
+    pub(crate) fn rewrite_html<'h>(
         html: &[u8],
         encoding: &'static Encoding,
-        element_content_handlers: Vec<(Cow<'_, Selector>, ElementContentHandlers)>,
-        document_content_handlers: Vec<DocumentContentHandlers>,
+        element_content_handlers: Vec<(Cow<'_, Selector>, ElementContentHandlers<'h>)>,
+        document_content_handlers: Vec<DocumentContentHandlers<'h>>,
     ) -> String {
         let mut output = Output::new(encoding);
 
@@ -129,12 +138,14 @@ mod test_utils {
                     element_content_handlers,
                     document_content_handlers,
                     encoding: AsciiCompatibleEncoding::new(encoding).unwrap(),
-                    ..Settings::default()
+                    ..Settings::new()
                 },
                 |c: &[u8]| output.push(c),
             );
 
-            rewriter.write(html).unwrap();
+            for ch in html.chunks(15) {
+                rewriter.write(ch).unwrap();
+            }
             rewriter.end().unwrap();
         }
 

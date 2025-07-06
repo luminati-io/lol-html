@@ -2,21 +2,23 @@ use super::*;
 use std::slice::Iter;
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_tag_name_get(element: *const Element) -> Str {
+pub unsafe extern "C" fn lol_html_element_tag_name_get(element: *const Element) -> Str {
     let element = to_ref!(element);
 
     Str::new(element.tag_name())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_tag_name_get_preserve_case(element: *const Element) -> Str {
+pub unsafe extern "C" fn lol_html_element_tag_name_get_preserve_case(
+    element: *const Element,
+) -> Str {
     let element = to_ref!(element);
 
     Str::new(element.tag_name_preserve_case())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_tag_name_set(
+pub unsafe extern "C" fn lol_html_element_tag_name_set(
     element: *mut Element,
     name: *const c_char,
     name_len: size_t,
@@ -30,17 +32,7 @@ pub extern "C" fn lol_html_element_tag_name_set(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_is_self_closing(element: *mut Element) -> bool {
-    to_ref!(element).is_self_closing()
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_can_have_content(element: *mut Element) -> bool {
-    to_ref!(element).can_have_content()
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_namespace_uri_get(element: *mut Element) -> *const c_char {
+pub unsafe extern "C" fn lol_html_element_namespace_uri_get(element: *mut Element) -> *const c_char {
     let element = to_ref!(element);
 
     match element.namespace_uri() {
@@ -52,7 +44,7 @@ pub extern "C" fn lol_html_element_namespace_uri_get(element: *mut Element) -> *
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attributes_iterator_get<'r, 't>(
+pub unsafe extern "C" fn lol_html_attributes_iterator_get<'r, 't>(
     element: *const Element<'r, 't>,
 ) -> *mut Iter<'r, Attribute<'t>> {
     let attributes = to_ref!(element).attributes();
@@ -61,8 +53,8 @@ pub extern "C" fn lol_html_attributes_iterator_get<'r, 't>(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attributes_iterator_next<'r, 't>(
-    iterator: *mut Iter<'r, Attribute<'t>>,
+pub unsafe extern "C" fn lol_html_attributes_iterator_next<'t>(
+    iterator: *mut Iter<'_, Attribute<'t>>,
 ) -> *const Attribute<'t> {
     let iterator = to_ref_mut!(iterator);
 
@@ -73,33 +65,35 @@ pub extern "C" fn lol_html_attributes_iterator_next<'r, 't>(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attributes_iterator_free(iterator: *mut Iter<Attribute>) {
+pub unsafe extern "C" fn lol_html_attributes_iterator_free(iterator: *mut Iter<Attribute>) {
     drop(to_box!(iterator));
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attribute_name_get(attribute: *const Attribute) -> Str {
+pub unsafe extern "C" fn lol_html_attribute_name_get(attribute: *const Attribute) -> Str {
     let attribute = to_ref!(attribute);
 
     Str::new(attribute.name())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attribute_name_get_preserve_case(attribute: *const Attribute) -> Str {
+pub unsafe extern "C" fn lol_html_attribute_name_get_preserve_case(
+    attribute: *const Attribute,
+) -> Str {
     let attribute = to_ref!(attribute);
 
     Str::new(attribute.name_preserve_case())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_attribute_value_get(attribute: *const Attribute) -> Str {
+pub unsafe extern "C" fn lol_html_attribute_value_get(attribute: *const Attribute) -> Str {
     let attribute = to_ref!(attribute);
 
     Str::new(attribute.value())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_get_attribute(
+pub unsafe extern "C" fn lol_html_element_get_attribute(
     element: *const Element,
     name: *const c_char,
     name_len: size_t,
@@ -111,7 +105,7 @@ pub extern "C" fn lol_html_element_get_attribute(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_has_attribute(
+pub unsafe extern "C" fn lol_html_element_has_attribute(
     element: *const Element,
     name: *const c_char,
     name_len: size_t,
@@ -127,7 +121,7 @@ pub extern "C" fn lol_html_element_has_attribute(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_set_attribute(
+pub unsafe extern "C" fn lol_html_element_set_attribute(
     element: *mut Element,
     name: *const c_char,
     name_len: size_t,
@@ -144,7 +138,7 @@ pub extern "C" fn lol_html_element_set_attribute(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_remove_attribute(
+pub unsafe extern "C" fn lol_html_element_remove_attribute(
     element: *mut Element,
     name: *const c_char,
     name_len: size_t,
@@ -157,95 +151,43 @@ pub extern "C" fn lol_html_element_remove_attribute(
     0
 }
 
+impl_content_mutation_handlers! { element: Element [
+    lol_html_element_prepend => prepend,
+    lol_html_element_append => append,
+    lol_html_element_before => before,
+    lol_html_element_after => after,
+    lol_html_element_set_inner_content => set_inner_content,
+    lol_html_element_replace => replace,
+    @VOID lol_html_element_remove => remove,
+    @VOID lol_html_element_remove_and_keep_content => remove_and_keep_content,
+    @BOOL lol_html_element_is_removed => removed,
+    @BOOL lol_html_element_is_self_closing => is_self_closing,
+    @BOOL lol_html_element_can_have_content => can_have_content,
+    @STREAM lol_html_element_streaming_prepend => streaming_prepend,
+    @STREAM lol_html_element_streaming_append => streaming_append,
+    @STREAM lol_html_element_streaming_before => streaming_before,
+    @STREAM lol_html_element_streaming_after => streaming_after,
+    @STREAM lol_html_element_streaming_set_inner_content => streaming_set_inner_content,
+    @STREAM lol_html_element_streaming_replace => streaming_replace,
+] }
+
 #[no_mangle]
-pub extern "C" fn lol_html_element_before(
+pub unsafe extern "C" fn lol_html_element_user_data_set(
     element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.before(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_prepend(
-    element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.prepend(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_append(
-    element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.append(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_after(
-    element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.after(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_set_inner_content(
-    element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.set_inner_content(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_replace(
-    element: *mut Element,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { element.replace(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_remove(element: *mut Element) {
-    to_ref_mut!(element).remove();
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_remove_and_keep_content(element: *mut Element) {
-    to_ref_mut!(element).remove_and_keep_content();
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_is_removed(element: *mut Element) -> bool {
-    to_ref_mut!(element).removed()
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_element_user_data_set(element: *mut Element, user_data: *mut c_void) {
+    user_data: *mut c_void,
+) {
     to_ref_mut!(element).set_user_data(user_data);
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_user_data_get(element: *mut Element) -> *mut c_void {
+pub unsafe extern "C" fn lol_html_element_user_data_get(element: *mut Element) -> *mut c_void {
     get_user_data!(element)
 }
 
 type EndTagHandler = unsafe extern "C" fn(*mut EndTag, *mut c_void) -> RewriterDirective;
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_add_end_tag_handler(
+pub unsafe extern "C" fn lol_html_element_add_end_tag_handler(
     element: *mut Element,
     handler: EndTagHandler,
     user_data: *mut c_void,
@@ -267,52 +209,37 @@ pub extern "C" fn lol_html_element_add_end_tag_handler(
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_element_clear_end_tag_handlers(element: *mut Element) {
+pub unsafe extern "C" fn lol_html_element_clear_end_tag_handlers(element: *mut Element) {
     let element = to_ref_mut!(element);
     if let Some(handlers) = element.end_tag_handlers() {
         handlers.clear();
     }
 }
 
-#[no_mangle]
-pub extern "C" fn lol_html_end_tag_before(
-    end_tag: *mut EndTag,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { end_tag.before(content, content_len, is_html) }
-}
+impl_content_mutation_handlers! { end_tag: EndTag [
+    lol_html_end_tag_before => before,
+    lol_html_end_tag_after => after,
+    lol_html_end_tag_replace => replace,
+    @VOID lol_html_end_tag_remove => remove,
+    @STREAM lol_html_end_tag_streaming_before => streaming_before,
+    @STREAM lol_html_end_tag_streaming_after => streaming_after,
+    @STREAM lol_html_end_tag_streaming_replace => streaming_replace,
+] }
 
 #[no_mangle]
-pub extern "C" fn lol_html_end_tag_after(
-    end_tag: *mut EndTag,
-    content: *const c_char,
-    content_len: size_t,
-    is_html: bool,
-) -> c_int {
-    content_insertion_fn_body! { end_tag.after(content, content_len, is_html) }
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_end_tag_remove(end_tag: *mut EndTag) {
-    to_ref_mut!(end_tag).remove();
-}
-
-#[no_mangle]
-pub extern "C" fn lol_html_end_tag_name_get(end_tag: *mut EndTag) -> Str {
+pub unsafe extern "C" fn lol_html_end_tag_name_get(end_tag: *mut EndTag) -> Str {
     let tag = to_ref_mut!(end_tag);
     Str::new(tag.name())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_end_tag_name_get_preserve_case(end_tag: *mut EndTag) -> Str {
+pub unsafe extern "C" fn lol_html_end_tag_name_get_preserve_case(end_tag: *mut EndTag) -> Str {
     let tag = to_ref_mut!(end_tag);
     Str::new(tag.name_preserve_case())
 }
 
 #[no_mangle]
-pub extern "C" fn lol_html_end_tag_name_set(
+pub unsafe extern "C" fn lol_html_end_tag_name_set(
     end_tag: *mut EndTag,
     name: *const c_char,
     len: size_t,

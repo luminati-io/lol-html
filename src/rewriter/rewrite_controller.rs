@@ -1,15 +1,16 @@
 use super::handlers_dispatcher::{ContentHandlersDispatcher, SelectorHandlersLocator};
-use super::RewritingError;
+use super::{HandlerTypes, RewritingError, Settings};
+use crate::base::SharedEncoding;
 use crate::html::{LocalName, Namespace};
+use crate::memory::SharedMemoryLimiter;
 use crate::rewritable_units::{DocumentEnd, Token, TokenCaptureFlags};
+use crate::selectors_vm::Ast;
 use crate::selectors_vm::{AuxStartTagInfoRequest, ElementData, SelectorMatchingVm, VmError};
-use crate::transform_stream::*;
+use crate::transform_stream::{DispatcherError, StartTagHandlingResult, TransformController};
 use hashbrown::HashSet;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 #[derive(Default)]
-pub struct ElementDescriptor {
+pub(crate) struct ElementDescriptor {
     pub matched_content_handlers: HashSet<SelectorHandlersLocator>,
     pub end_tag_handler_idx: Option<usize>,
     pub remove_content: bool,
@@ -24,44 +25,82 @@ impl ElementData for ElementDescriptor {
     }
 }
 
-pub struct HtmlRewriteController<'h> {
-    handlers_dispatcher: Rc<RefCell<ContentHandlersDispatcher<'h>>>,
+pub(crate) struct HtmlRewriteController<'h, H: HandlerTypes> {
+    handlers_dispatcher: ContentHandlersDispatcher<'h, H>,
     selector_matching_vm: Option<SelectorMatchingVm<ElementDescriptor>>,
 }
 
-impl<'h> HtmlRewriteController<'h> {
+impl<'h, H: HandlerTypes> HtmlRewriteController<'h, H> {
+    // `HtmlRewriter::new` has a generic `OutputSink`, so inlining this method
+    // would needlessly duplicate the code for every sink.
+    #[inline(never)]
+    pub(super) fn from_settings(
+        settings: Settings<'h, '_, H>,
+        memory_limiter: &SharedMemoryLimiter,
+        encoding: &SharedEncoding,
+    ) -> Self {
+        let mut selectors_ast = Ast::default();
+        let mut dispatcher = ContentHandlersDispatcher::<H>::default();
+        let has_selectors =
+            !settings.element_content_handlers.is_empty() || settings.adjust_charset_on_meta_tag;
+
+        let charset_adjust_handler = if settings.adjust_charset_on_meta_tag {
+            let encoding = SharedEncoding::clone(encoding);
+            Some(super::handler_adjust_charset_on_meta_tag(encoding))
+        } else {
+            None
+        };
+
+        let element_content_handlers = charset_adjust_handler
+            .into_iter()
+            .chain(settings.element_content_handlers);
+
+        for (selector, handlers) in element_content_handlers {
+            let locator = dispatcher.add_selector_associated_handlers(handlers);
+
+            selectors_ast.add_selector(&selector, locator);
+        }
+
+        for handlers in settings.document_content_handlers {
+            dispatcher.add_document_content_handlers(handlers);
+        }
+
+        let selector_matching_vm = if has_selectors {
+            Some(SelectorMatchingVm::new(
+                selectors_ast,
+                settings.encoding.into(),
+                memory_limiter.clone(),
+                settings.enable_esi_tags,
+            ))
+        } else {
+            None
+        };
+
+        Self::new(dispatcher, selector_matching_vm)
+    }
+
     #[inline]
-    pub fn new(
-        handlers_dispatcher: ContentHandlersDispatcher<'h>,
+    pub(crate) const fn new(
+        handlers_dispatcher: ContentHandlersDispatcher<'h, H>,
         selector_matching_vm: Option<SelectorMatchingVm<ElementDescriptor>>,
     ) -> Self {
         HtmlRewriteController {
-            handlers_dispatcher: Rc::new(RefCell::new(handlers_dispatcher)),
+            handlers_dispatcher,
             selector_matching_vm,
         }
     }
 }
 
-// NOTE: it's a macro instead of an instance method, so it can be executed
-// when we hold a mutable reference for the selector matching VM.
-macro_rules! create_match_handler {
-    ($self:tt) => {{
-        let handlers_dispatcher = Rc::clone(&$self.handlers_dispatcher);
-
-        move |m| handlers_dispatcher.borrow_mut().start_matching(m)
-    }};
-}
-
-impl<'h> HtmlRewriteController<'h> {
+impl<H: HandlerTypes> HtmlRewriteController<'_, H> {
     #[inline]
     fn respond_to_aux_info_request(
         aux_info_req: AuxStartTagInfoRequest<ElementDescriptor, SelectorHandlersLocator>,
     ) -> StartTagHandlingResult<Self> {
         Err(DispatcherError::InfoRequest(Box::new(
             move |this, aux_info| {
-                let mut match_handler = create_match_handler!(this);
-
                 if let Some(ref mut vm) = this.selector_matching_vm {
+                    let mut match_handler = |m| this.handlers_dispatcher.start_matching(&m);
+
                     aux_info_req(vm, aux_info, &mut match_handler)
                         .map_err(RewritingError::MemoryLimitExceeded)?;
                 }
@@ -73,11 +112,11 @@ impl<'h> HtmlRewriteController<'h> {
 
     #[inline]
     fn get_capture_flags(&self) -> TokenCaptureFlags {
-        self.handlers_dispatcher.borrow().get_token_capture_flags()
+        self.handlers_dispatcher.get_token_capture_flags()
     }
 }
 
-impl TransformController for HtmlRewriteController<'_> {
+impl<H: HandlerTypes> TransformController for HtmlRewriteController<'_, H> {
     #[inline]
     fn initial_capture_flags(&self) -> TokenCaptureFlags {
         self.get_capture_flags()
@@ -85,15 +124,15 @@ impl TransformController for HtmlRewriteController<'_> {
 
     fn handle_start_tag(
         &mut self,
-        local_name: LocalName,
+        local_name: LocalName<'_>,
         ns: Namespace,
     ) -> StartTagHandlingResult<Self> {
         match self.selector_matching_vm {
             Some(ref mut vm) => {
-                let mut match_handler = create_match_handler!(self);
+                let mut match_handler = |m| self.handlers_dispatcher.start_matching(&m);
 
                 match vm.exec_for_start_tag(local_name, ns, &mut match_handler) {
-                    Ok(_) => Ok(self.get_capture_flags()),
+                    Ok(()) => Ok(self.get_capture_flags()),
                     Err(VmError::InfoRequest(req)) => Self::respond_to_aux_info_request(req),
                     Err(VmError::MemoryLimitExceeded(e)) => Err(DispatcherError::RewritingError(
                         RewritingError::MemoryLimitExceeded(e),
@@ -106,12 +145,10 @@ impl TransformController for HtmlRewriteController<'_> {
         }
     }
 
-    fn handle_end_tag(&mut self, local_name: LocalName) -> TokenCaptureFlags {
+    fn handle_end_tag(&mut self, local_name: LocalName<'_>) -> TokenCaptureFlags {
         if let Some(ref mut vm) = self.selector_matching_vm {
-            let handlers_dispatcher = Rc::clone(&self.handlers_dispatcher);
-
-            vm.exec_for_end_tag(local_name, move |elem_desc| {
-                handlers_dispatcher.borrow_mut().stop_matching(elem_desc);
+            vm.exec_for_end_tag(local_name, |elem_desc| {
+                self.handlers_dispatcher.stop_matching(elem_desc);
             });
         }
 
@@ -119,21 +156,19 @@ impl TransformController for HtmlRewriteController<'_> {
     }
 
     #[inline]
-    fn handle_token(&mut self, token: &mut Token) -> Result<(), RewritingError> {
+    fn handle_token(&mut self, token: &mut Token<'_>) -> Result<(), RewritingError> {
         let current_element_data = self
             .selector_matching_vm
             .as_mut()
             .and_then(SelectorMatchingVm::current_element_data_mut);
 
         self.handlers_dispatcher
-            .borrow_mut()
             .handle_token(token, current_element_data)
             .map_err(RewritingError::ContentHandlerError)
     }
 
-    fn handle_end(&mut self, document_end: &mut DocumentEnd) -> Result<(), RewritingError> {
+    fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> Result<(), RewritingError> {
         self.handlers_dispatcher
-            .borrow_mut()
             .handle_end(document_end)
             .map_err(RewritingError::ContentHandlerError)
     }
@@ -142,7 +177,6 @@ impl TransformController for HtmlRewriteController<'_> {
     fn should_emit_content(&self) -> bool {
         !self
             .handlers_dispatcher
-            .borrow()
             .has_matched_elements_with_removed_content()
     }
 }

@@ -5,34 +5,80 @@ use selectors::parser::{
     Combinator, Component, NonTSPseudoClass, Parser, PseudoElement, SelectorImpl, SelectorList,
     SelectorParseErrorKind,
 };
+use selectors::parser::{NthSelectorData, ParseRelative};
 use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SelectorImplDescriptor;
+pub(crate) struct SelectorImplDescriptor;
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct CssString(Box<str>);
+
+impl<'a> From<&'a str> for CssString {
+    fn from(value: &'a str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl CssString {
+    pub fn to_boxed_slice(&self) -> Box<str> {
+        self.0.clone()
+    }
+}
+
+impl std::ops::Deref for CssString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl ToCss for CssString {
+    fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
+        dest.write_str(&self.0)
+    }
+}
+
+impl precomputed_hash::PrecomputedHash for CssString {
+    fn precomputed_hash(&self) -> u32 {
+        if let Some(v) = self.0.as_bytes().get(..4) {
+            let mut tmp = [0u8; 4];
+            tmp.copy_from_slice(v);
+            u32::from_ne_bytes(tmp)
+        } else {
+            0
+        }
+    }
+}
+
+impl precomputed_hash::PrecomputedHash for Namespace {
+    fn precomputed_hash(&self) -> u32 {
+        *self as u32
+    }
+}
 
 impl SelectorImpl for SelectorImplDescriptor {
-    type AttrValue = String;
-    type Identifier = String;
-    type ClassName = String;
-    type PartName = String;
-    type LocalName = String;
-    type NamespacePrefix = String;
+    type AttrValue = CssString;
+    type Identifier = CssString;
+    type LocalName = CssString;
+    type NamespacePrefix = CssString;
     type NamespaceUrl = Namespace;
     type BorrowedNamespaceUrl = Namespace;
-    type BorrowedLocalName = String;
+    type BorrowedLocalName = CssString;
 
     type NonTSPseudoClass = NonTSPseudoClassStub;
     type PseudoElement = PseudoElementStub;
 
-    type ExtraMatchingData = ();
+    type ExtraMatchingData<'unused> = ();
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
-pub enum PseudoElementStub {}
+pub(crate) enum PseudoElementStub {}
 
 impl ToCss for PseudoElementStub {
     fn to_css<W: fmt::Write>(&self, _dest: &mut W) -> fmt::Result {
+        #[allow(clippy::uninhabited_references)]
         match *self {}
     }
 }
@@ -42,26 +88,25 @@ impl PseudoElement for PseudoElementStub {
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
-pub enum NonTSPseudoClassStub {}
+pub(crate) enum NonTSPseudoClassStub {}
 
 impl NonTSPseudoClass for NonTSPseudoClassStub {
     type Impl = SelectorImplDescriptor;
 
     fn is_active_or_hover(&self) -> bool {
+        #[allow(clippy::uninhabited_references)]
         match *self {}
     }
 
     fn is_user_action_state(&self) -> bool {
-        match *self {}
-    }
-
-    fn has_zero_specificity(&self) -> bool {
+        #[allow(clippy::uninhabited_references)]
         match *self {}
     }
 }
 
 impl ToCss for NonTSPseudoClassStub {
     fn to_css<W: fmt::Write>(&self, _dest: &mut W) -> fmt::Result {
+        #[allow(clippy::uninhabited_references)]
         match *self {}
     }
 }
@@ -87,7 +132,7 @@ impl SelectorsParser {
                 Combinator::NextSibling => Err(SelectorError::UnsupportedCombinator('+')),
                 Combinator::LaterSibling => Err(SelectorError::UnsupportedCombinator('~')),
                 Combinator::PseudoElement | Combinator::SlotAssignment => {
-                    unreachable!("Pseudo element combinators should be filtered out at this point")
+                    Err(SelectorError::UnsupportedPseudoClassOrElement)
                 }
             },
 
@@ -98,49 +143,72 @@ impl SelectorsParser {
             | Component::ExplicitNoNamespace
             | Component::ID(_)
             | Component::Class(_)
-            | Component::FirstChild
-            | Component::NthChild(_, _)
-            | Component::FirstOfType
-            | Component::NthOfType(_, _)
             | Component::AttributeInNoNamespaceExists { .. }
             | Component::AttributeInNoNamespace { .. } => Ok(()),
 
-            Component::Negation(components) => {
-                components.iter().try_for_each(Self::validate_component)
-            }
+            Component::Nth(data) => Self::validate_nth(data),
+
+            Component::Negation(selectors) => selectors
+                .slice()
+                .iter()
+                .try_for_each(|s| s.iter().try_for_each(Self::validate_component)),
 
             // Unsupported
             Component::Empty
             | Component::Part(_)
             | Component::Host(_)
-            | Component::LastChild
-            | Component::LastOfType
-            | Component::NthLastChild(_, _)
-            | Component::NthLastOfType(_, _)
-            | Component::OnlyChild
-            | Component::OnlyOfType
+            | Component::Is(_)
             | Component::Root
             | Component::Scope
+            | Component::Where(_)
             | Component::PseudoElement(_)
             | Component::NonTSPseudoClass(_)
             | Component::Slotted(_) => Err(SelectorError::UnsupportedPseudoClassOrElement),
 
+            // This is for `:nth-child(n of .selector)`,
+            // which is subtly different from `.selector:nth-of-type(n)`
+            Component::NthOf(_) => Err(SelectorError::UnsupportedPseudoClassOrElement),
+
             Component::DefaultNamespace(_)
             | Component::Namespace(_, _)
             | Component::AttributeOther(_) => Err(SelectorError::NamespacedSelector),
+
+            Component::ImplicitScope
+            | Component::ParentSelector
+            | Component::RelativeSelectorAnchor
+            | Component::Has(_) => Err(SelectorError::UnsupportedSyntax),
+            Component::Invalid(_) => Err(SelectorError::UnexpectedToken),
         }
     }
 
     fn validate(
         selector_list: SelectorList<SelectorImplDescriptor>,
     ) -> Result<SelectorList<SelectorImplDescriptor>, SelectorError> {
-        for selector in selector_list.0.iter() {
+        Self::validate_selectors(selector_list.slice())?;
+        Ok(selector_list)
+    }
+
+    fn validate_selectors(
+        selector_list: &[selectors::parser::Selector<SelectorImplDescriptor>],
+    ) -> Result<(), SelectorError> {
+        for selector in selector_list {
             for component in selector.iter_raw_match_order() {
                 Self::validate_component(component)?;
             }
         }
+        Ok(())
+    }
 
-        Ok(selector_list)
+    fn validate_nth(nth: &NthSelectorData) -> Result<(), SelectorError> {
+        match nth.ty {
+            selectors::parser::NthType::Child | selectors::parser::NthType::OfType => Ok(()),
+            selectors::parser::NthType::LastChild
+            | selectors::parser::NthType::OnlyChild
+            | selectors::parser::NthType::LastOfType
+            | selectors::parser::NthType::OnlyOfType => {
+                Err(SelectorError::UnsupportedPseudoClassOrElement)
+            }
+        }
     }
 
     #[inline]
@@ -148,7 +216,7 @@ impl SelectorsParser {
         let mut input = ParserInput::new(selector);
         let mut css_parser = CssParser::new(&mut input);
 
-        SelectorList::parse(&Self, &mut css_parser)
+        SelectorList::parse(&Self, &mut css_parser, ParseRelative::No)
             .map_err(SelectorError::from)
             .and_then(Self::validate)
     }
@@ -157,6 +225,10 @@ impl SelectorsParser {
 impl<'i> Parser<'i> for SelectorsParser {
     type Impl = SelectorImplDescriptor;
     type Error = SelectorParseErrorKind<'i>;
+
+    fn parse_nth_child_of(&self) -> bool {
+        false
+    }
 }
 
 /// Parsed CSS selector.
@@ -214,6 +286,6 @@ impl FromStr for Selector {
 
     #[inline]
     fn from_str(selector: &str) -> Result<Self, Self::Err> {
-        Ok(Selector(SelectorsParser::parse(selector)?))
+        Ok(Self(SelectorsParser::parse(selector)?))
     }
 }

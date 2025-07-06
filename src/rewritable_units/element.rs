@@ -1,8 +1,13 @@
-use super::{Attribute, AttributeNameError, ContentType, EndTag, Mutations, StartTag};
-use crate::base::Bytes;
-use crate::rewriter::EndTagHandler;
+use super::mutations::MutationsInner;
+use super::{
+    Attribute, AttributeNameError, ContentType, EndTag, Mutations, StartTag, StreamingHandler,
+    StringChunk,
+};
+use crate::base::{BytesCow, SourceLocation};
+use crate::rewriter::{HandlerTypes, LocalHandlerTypes};
 use encoding_rs::Encoding;
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use thiserror::Error;
 
@@ -33,18 +38,20 @@ pub enum TagNameError {
 /// An HTML element rewritable unit.
 ///
 /// Exposes API for examination and modification of a parsed HTML element.
-pub struct Element<'r, 't> {
+pub struct Element<'r, 't, H: HandlerTypes = LocalHandlerTypes> {
     start_tag: &'r mut StartTag<'t>,
     end_tag_mutations: Option<Mutations>,
-    modified_end_tag_name: Option<Bytes<'static>>,
-    end_tag_handlers: Vec<EndTagHandler<'static>>,
+    modified_end_tag_name: Option<Box<[u8]>>,
+    end_tag_handlers: Vec<H::EndTagHandler<'static>>,
     can_have_content: bool,
     should_remove_content: bool,
     encoding: &'static Encoding,
     user_data: Box<dyn Any>,
 }
 
-impl<'r, 't> Element<'r, 't> {
+impl<'r, 't, H: HandlerTypes> Element<'r, 't, H> {
+    #[inline]
+    #[must_use]
     pub(crate) fn new(start_tag: &'r mut StartTag<'t>, can_have_content: bool) -> Self {
         let encoding = start_tag.encoding();
 
@@ -60,24 +67,24 @@ impl<'r, 't> Element<'r, 't> {
         }
     }
 
-    fn tag_name_bytes_from_str(&self, name: &str) -> Result<Bytes<'static>, TagNameError> {
-        match name.chars().next() {
+    fn tag_name_bytes_from_str(&self, name: &str) -> Result<BytesCow<'static>, TagNameError> {
+        match name.as_bytes().first() {
             Some(ch) if !ch.is_ascii_alphabetic() => Err(TagNameError::InvalidFirstCharacter),
             Some(_) => {
-                if let Some(ch) = name
-                    .chars()
-                    .find(|&ch| matches!(ch, ' ' | '\n' | '\r' | '\t' | '\x0C' | '/' | '>'))
+                if let Some(ch) =
+                    name.as_bytes().iter().copied().find(|&ch| {
+                        matches!(ch, b' ' | b'\n' | b'\r' | b'\t' | b'\x0C' | b'/' | b'>')
+                    })
                 {
-                    Err(TagNameError::ForbiddenCharacter(ch))
+                    Err(TagNameError::ForbiddenCharacter(ch as char))
                 } else {
                     // NOTE: if character can't be represented in the given
                     // encoding then encoding_rs replaces it with a numeric
                     // character reference. Character references are not
                     // supported in tag names, so we need to bail.
-                    match Bytes::from_str_without_replacements(name, self.encoding) {
-                        Ok(name) => Ok(name.into_owned()),
-                        Err(_) => Err(TagNameError::UnencodableCharacter),
-                    }
+                    BytesCow::from_str_without_replacements(name, self.encoding)
+                        .map_err(|_| TagNameError::UnencodableCharacter)
+                        .map(BytesCow::into_owned)
                 }
             }
             None => Err(TagNameError::Empty),
@@ -86,55 +93,79 @@ impl<'r, 't> Element<'r, 't> {
 
     #[inline]
     fn remove_content(&mut self) {
-        self.start_tag.mutations.content_after.clear();
-        self.end_tag_mutations_mut().content_before.clear();
+        self.start_tag.mutations.mutate().content_after.clear();
+        if let Some(end) = self.end_tag_mutations.as_mut().and_then(|m| m.if_mutated()) {
+            end.content_before.clear();
+        }
         self.should_remove_content = true;
     }
 
     #[inline]
-    fn end_tag_mutations_mut(&mut self) -> &mut Mutations {
-        let encoding = self.encoding;
-
+    fn end_tag_mutations_mut(&mut self) -> &mut MutationsInner {
         self.end_tag_mutations
-            .get_or_insert_with(|| Mutations::new(encoding))
+            .get_or_insert_with(Mutations::new)
+            .mutate()
     }
 
     /// Returns the tag name of the element.
     #[inline]
+    #[must_use]
     pub fn tag_name(&self) -> String {
         self.start_tag.name()
     }
 
     /// Returns the tag name of the element, preserving its case.
     #[inline]
+    #[must_use]
     pub fn tag_name_preserve_case(&self) -> String {
         self.start_tag.name_preserve_case()
     }
 
     /// Sets the tag name of the element.
+    ///
+    /// The new tag name must be in the same namespace, have the same content model, and be valid in its location.
+    /// Otherwise change of the tag name may cause the resulting document to be parsed in an unexpected way,
+    /// out of sync with this library.
     #[inline]
     pub fn set_tag_name(&mut self, name: &str) -> Result<(), TagNameError> {
         let name = self.tag_name_bytes_from_str(name)?;
 
         if self.can_have_content {
-            self.modified_end_tag_name = Some(name.clone());
+            self.modified_end_tag_name = Some((*name).into());
         }
 
-        self.start_tag.set_name(name);
+        self.start_tag.set_name_raw(name);
 
         Ok(())
     }
 
-    /// Whether the element is explicitly self-closing, e.g. `<foo />`.
+    /// Whether the tag syntactically ends with `/>`. In HTML content this is purely a decorative, unnecessary, and has no effect of any kind.
+    ///
+    /// The `/>` syntax only affects parsing of elements in foreign content (SVG and MathML).
+    /// It will never close any HTML tags that aren't already defined as [void][spec] in HTML.
+    ///
+    /// This function only reports the parsed syntax, and will not report which elements are actually void in HTML.
+    /// Use [`can_have_content()`][Self::can_have_content] to check if the element is non-void.
+    ///
+    /// [spec]: https://html.spec.whatwg.org/multipage/syntax.html#start-tags
+    ///
+    /// If the `/` is part of an unquoted attribute, it's not parsed as the self-closing syntax.
     #[inline]
+    #[must_use]
     pub fn is_self_closing(&self) -> bool {
         self.start_tag.self_closing()
     }
 
-    /// Whether the element can have inner content.  Returns `true` unless the element is an [HTML void
-    /// element](https://html.spec.whatwg.org/multipage/syntax.html#void-elements) or has a
-    /// self-closing tag (eg, `<foo />`).
+    /// Whether the element can have inner content.
+    ///
+    /// Returns `true` if the element isn't a [void element in HTML][void],
+    /// or is in **foreign content** and doesn't have a self-closing tag (eg, `<svg />`).
+    ///
+    /// [void]: https://html.spec.whatwg.org/multipage/syntax.html#void-elements
+    ///
+    /// Note that the self-closing syntax has no effect in HTML content.
     #[inline]
+    #[must_use]
     pub fn can_have_content(&self) -> bool {
         self.can_have_content
     }
@@ -143,20 +174,23 @@ impl<'r, 't> Element<'r, 't> {
     ///
     /// [namespace URI]: https://developer.mozilla.org/en-US/docs/Web/API/Element/namespaceURI
     #[inline]
+    #[must_use]
     pub fn namespace_uri(&self) -> &'static str {
         self.start_tag.namespace_uri()
     }
 
     /// Returns an immutable collection of element's attributes.
     #[inline]
+    #[must_use]
     pub fn attributes(&self) -> &[Attribute<'t>] {
         self.start_tag.attributes()
     }
 
-    /// Returns the value of an attribute with the `name`.
+    /// Returns the value of an attribute with the `name`. The value may have HTML/XML entities.
     ///
     /// Returns `None` if the element doesn't have an attribute with the `name`.
     #[inline]
+    #[must_use]
     pub fn get_attribute(&self, name: &str) -> Option<String> {
         let name = name.to_ascii_lowercase();
 
@@ -171,13 +205,16 @@ impl<'r, 't> Element<'r, 't> {
 
     /// Returns `true` if the element has an attribute with `name`.
     #[inline]
+    #[must_use]
     pub fn has_attribute(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
 
         self.attributes().iter().any(|attr| attr.name() == name)
     }
 
-    /// Sets `value` of element's attribute with `name`.
+    /// Sets `value` of element's attribute with `name`. The value may have HTML/XML entities.
+    ///
+    /// `"` will be entity-escaped if needed. `&` won't be escaped.
     ///
     /// If element doesn't have an attribute with the `name`, method adds a new attribute
     /// to the element with `name` and `value`.
@@ -214,7 +251,7 @@ impl<'r, 't> Element<'r, 't> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -222,7 +259,24 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn before(&mut self, content: &str, content_type: ContentType) {
-        self.start_tag.mutations.before(content, content_type);
+        self.start_tag
+            .mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::from_str(content, content_type));
+    }
+
+    /// Inserts  content from a [`StreamingHandler`] before the element.
+    ///
+    /// Consequent calls to the method append to the previously inserted content.
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_before(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.start_tag
+            .mutations
+            .mutate()
+            .content_before
+            .push_back(StringChunk::stream(string_writer));
     }
 
     /// Inserts `content` after the element.
@@ -247,7 +301,7 @@ impl<'r, 't> Element<'r, 't> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -255,11 +309,26 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn after(&mut self, content: &str, content_type: ContentType) {
+        self.after_chunk(StringChunk::from_str(content, content_type));
+    }
+
+    fn after_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.end_tag_mutations_mut().after(content, content_type);
+            &mut self.end_tag_mutations_mut().content_after
         } else {
-            self.start_tag.mutations.after(content, content_type);
+            &mut self.start_tag.mutations.mutate().content_after
         }
+        .push_front(chunk);
+    }
+
+    /// Inserts content from a [`StreamingHandler`] after the element.
+    ///
+    /// Consequent calls to the method prepend to the previously inserted content.
+    ///
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_after(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.after_chunk(StringChunk::stream(string_writer));
     }
 
     /// Prepends `content` to the element's inner content, i.e. inserts content right after
@@ -291,7 +360,7 @@ impl<'r, 't> Element<'r, 't> {
     ///             element!("#foo", handler),
     ///             element!("img", handler),
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -299,9 +368,32 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn prepend(&mut self, content: &str, content_type: ContentType) {
+        self.prepend_chunk(StringChunk::from_str(content, content_type));
+    }
+
+    fn prepend_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.start_tag.mutations.after(content, content_type);
+            self.start_tag.set_self_closing_syntax(false);
+            self.start_tag
+                .mutations
+                .mutate()
+                .content_after
+                .push_front(chunk);
         }
+    }
+
+    /// Prepends content from a [`StreamingHandler`] to the element's inner content,
+    /// i.e. inserts content right after the element's start tag.
+    ///
+    /// Consequent calls to the method prepend to the previously inserted content.
+    /// A call to the method doesn't make any effect if the element is an [empty element].
+    ///
+    /// [empty element]: https://developer.mozilla.org/en-US/docs/Glossary/Empty_element
+    ///
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_prepend(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.prepend_chunk(StringChunk::stream(string_writer));
     }
 
     /// Appends `content` to the element's inner content, i.e. inserts content right before
@@ -333,7 +425,7 @@ impl<'r, 't> Element<'r, 't> {
     ///             element!("#foo", handler),
     ///             element!("img", handler),
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -341,9 +433,27 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn append(&mut self, content: &str, content_type: ContentType) {
+        self.append_chunk(StringChunk::from_str(content, content_type));
+    }
+
+    fn append_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
-            self.end_tag_mutations_mut().before(content, content_type);
+            self.start_tag.set_self_closing_syntax(false);
+            self.end_tag_mutations_mut().content_before.push_back(chunk);
         }
+    }
+
+    /// Appends content from a [`StreamingHandler`] to the element's inner content,
+    /// i.e. inserts content right before the element's end tag.
+    ///
+    /// Consequent calls to the method append to the previously inserted content.
+    /// A call to the method doesn't make any effect if the element is an [empty element].
+    ///
+    /// [empty element]: https://developer.mozilla.org/en-US/docs/Glossary/Empty_element
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_append(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.append_chunk(StringChunk::stream(string_writer));
     }
 
     /// Replaces inner content of the element with `content`.
@@ -374,7 +484,7 @@ impl<'r, 't> Element<'r, 't> {
     ///             element!("#foo", handler),
     ///             element!("img", handler),
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -382,10 +492,32 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn set_inner_content(&mut self, content: &str, content_type: ContentType) {
+        self.set_inner_content_chunk(StringChunk::from_str(content, content_type));
+    }
+
+    fn set_inner_content_chunk(&mut self, chunk: StringChunk) {
         if self.can_have_content {
+            self.start_tag.set_self_closing_syntax(false);
             self.remove_content();
-            self.start_tag.mutations.after(content, content_type);
+            self.start_tag
+                .mutations
+                .mutate()
+                .content_after
+                .push_front(chunk);
         }
+    }
+
+    /// Replaces inner content of the element with content from a [`StreamingHandler`].
+    ///
+    /// Consequent calls to the method overwrite previously inserted content.
+    /// A call to the method doesn't make any effect if the element is an [empty element].
+    ///
+    /// [empty element]: https://developer.mozilla.org/en-US/docs/Glossary/Empty_element
+    ///
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_set_inner_content(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.set_inner_content_chunk(StringChunk::stream(string_writer));
     }
 
     /// Replaces the element and its inner content with `content`.
@@ -409,7 +541,7 @@ impl<'r, 't> Element<'r, 't> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -417,7 +549,11 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn replace(&mut self, content: &str, content_type: ContentType) {
-        self.start_tag.mutations.replace(content, content_type);
+        self.replace_chunk(StringChunk::from_str(content, content_type));
+    }
+
+    fn replace_chunk(&mut self, chunk: StringChunk) {
+        self.start_tag.mutations.mutate().replace(chunk);
 
         if self.can_have_content {
             self.remove_content();
@@ -425,10 +561,20 @@ impl<'r, 't> Element<'r, 't> {
         }
     }
 
+    /// Replaces the element and its inner content with content from a [`StreamingHandler`].
+    ///
+    /// Consequent calls to the method overwrite previously inserted content.
+    ///
+    ///
+    /// Use the [`streaming!`] macro to make a `StreamingHandler` from a closure.
+    pub fn streaming_replace(&mut self, string_writer: Box<dyn StreamingHandler + Send>) {
+        self.replace_chunk(StringChunk::stream(string_writer));
+    }
+
     /// Removes the element and its inner content.
     #[inline]
     pub fn remove(&mut self) {
-        self.start_tag.mutations.remove();
+        self.start_tag.mutations.mutate().remove();
 
         if self.can_have_content {
             self.remove_content();
@@ -453,7 +599,7 @@ impl<'r, 't> Element<'r, 't> {
     ///                 Ok(())
     ///             })
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -461,7 +607,7 @@ impl<'r, 't> Element<'r, 't> {
     /// ```
     #[inline]
     pub fn remove_and_keep_content(&mut self) {
-        self.start_tag.mutations.remove();
+        self.start_tag.remove();
 
         if self.can_have_content {
             self.end_tag_mutations_mut().remove();
@@ -470,6 +616,7 @@ impl<'r, 't> Element<'r, 't> {
 
     /// Returns `true` if the element has been removed or replaced with some content.
     #[inline]
+    #[must_use]
     pub fn removed(&self) -> bool {
         self.start_tag.mutations.removed()
     }
@@ -485,22 +632,25 @@ impl<'r, 't> Element<'r, 't> {
         self.start_tag
     }
 
-    /// Returns the handlers that will run when the end tag is reached.  You can use this
-    /// to add your "on end tag" handlers.
+    /// Returns the handlers that will run when the end tag is reached.
+    ///
+    /// The handlers may not run if there is no explicit end tag.
+    ///
+    /// You can use this to add your "on end tag" handlers.
     ///
     /// This will return `None` if the element does not have an end tag.
     ///
     /// # Example
     ///
     /// ```
-    /// use lol_html::html_content::ContentType;
+    /// use lol_html::html_content::{ContentType, Element};
     /// use lol_html::{element, rewrite_str, text, RewriteStrSettings};
     /// let buffer = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     /// let html = rewrite_str(
     ///     "<span>Short</span><span><b>13</b> characters</span>",
     ///     RewriteStrSettings {
     ///         element_content_handlers: vec![
-    ///             element!("span", |el| {
+    ///             element!("span", |el: &mut Element| {
     ///                 // Truncate string for each new span.
     ///                 buffer.borrow_mut().clear();
     ///                 let buffer = buffer.clone();
@@ -527,14 +677,14 @@ impl<'r, 't> Element<'r, 't> {
     ///                 Ok(())
     ///             }),
     ///         ],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     },
     /// )
     /// .unwrap();
     ///
     /// assert_eq!(html, "<span>Short</SPAN><span><b>13</b> characters!</span>");
     /// ```
-    pub fn end_tag_handlers(&mut self) -> Option<&mut Vec<EndTagHandler<'static>>> {
+    pub fn end_tag_handlers(&mut self) -> Option<&mut Vec<H::EndTagHandler<'static>>> {
         if self.can_have_content {
             Some(&mut self.end_tag_handlers)
         } else {
@@ -542,40 +692,50 @@ impl<'r, 't> Element<'r, 't> {
         }
     }
 
-    pub(crate) fn into_end_tag_handler(self) -> Option<EndTagHandler<'static>> {
+    pub(crate) fn into_end_tag_handler(self) -> Option<H::EndTagHandler<'static>> {
         let end_tag_mutations = self.end_tag_mutations;
         let modified_end_tag_name = self.modified_end_tag_name;
-        let end_tag_handlers = self.end_tag_handlers;
+        let mut end_tag_handlers = self.end_tag_handlers;
 
         if end_tag_mutations.is_some()
             || modified_end_tag_name.is_some()
             || !end_tag_handlers.is_empty()
         {
-            Some(Box::new(move |end_tag: &mut EndTag| {
-                if let Some(name) = modified_end_tag_name {
-                    end_tag.set_name(name);
-                }
+            end_tag_handlers.insert(
+                0,
+                H::new_end_tag_handler(|end_tag: &mut EndTag<'_>| {
+                    if let Some(name) = modified_end_tag_name {
+                        end_tag.set_name_raw(Cow::from(name.into_vec()).into());
+                    }
 
-                if let Some(mutations) = end_tag_mutations {
-                    end_tag.mutations = mutations;
-                }
+                    if let Some(mutations) = end_tag_mutations {
+                        end_tag.mutations = mutations;
+                    }
 
-                for handler in end_tag_handlers.into_iter() {
-                    handler(end_tag)?;
-                }
+                    Ok(())
+                }),
+            );
 
-                Ok(())
-            }))
+            Some(H::combine_handlers(end_tag_handlers))
         } else {
             None
         }
+    }
+
+    /// Position of this element's start tag in the source document, before any rewriting
+    ///
+    /// The end of this element hasn't been parsed yet. To find it, use [`Element::end_tag_handlers`].
+    #[must_use]
+    pub fn source_location(&self) -> SourceLocation {
+        self.start_tag.source_location()
     }
 }
 
 impl_user_data!(Element<'_, '_>);
 
-impl Debug for Element<'_, '_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl<H: HandlerTypes> Debug for Element<'_, '_, H> {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Element")
             .field("tag_name", &self.tag_name())
             .field("attributes", &self.attributes())
@@ -590,12 +750,13 @@ mod tests {
     use crate::rewritable_units::test_utils::*;
     use crate::*;
     use encoding_rs::{Encoding, EUC_JP, UTF_8};
+    use rewritable_units::StreamingHandlerSink;
 
     fn rewrite_element(
         html: &[u8],
         encoding: &'static Encoding,
         selector: &str,
-        mut handler: impl FnMut(&mut Element),
+        mut handler: impl FnMut(&mut Element<'_, '_>),
     ) -> String {
         let mut handler_called = false;
 
@@ -612,7 +773,11 @@ mod tests {
                     el.before("[before: should be removed]", ContentType::Text);
                     el.after("[after: should be removed]", ContentType::Text);
                     el.append("[append: should be removed]", ContentType::Text);
-                    el.before("[before: should be removed]", ContentType::Text);
+                    el.streaming_before(Box::new(|sink: &mut StreamingHandlerSink<'_>| {
+                        sink.write_str("[before:", ContentType::Text);
+                        sink.write_str(" should be removed]", ContentType::Text);
+                        Ok(())
+                    }));
                     Ok(())
                 }),
             ],
@@ -634,10 +799,181 @@ mod tests {
     }
 
     #[test]
+    fn sanitizer_bypass1() {
+        let out = rewrite_element(
+            b"<math><style><img></style></math>
+             <textarea><!--</textarea><img>--></textarea>
+             <div><style><img></style></div>",
+            UTF_8,
+            "img",
+            |el| el.set_tag_name("TROUBLE").unwrap(),
+        );
+        assert_eq!(
+            out,
+            "<math><style><TROUBLE></style></math>
+             <textarea><!--</textarea><TROUBLE>--></textarea>
+             <div><style><img></style></div>"
+        );
+    }
+
+    #[test]
+    fn sanitizer_bypass2() {
+        let out = rewrite_element(
+            b"<svg><p><style><!--</style><img>--></style>
+            <math><p></p><style><!--</style><img src/onerror>--></style></math>",
+            UTF_8,
+            "img",
+            |el| el.set_tag_name("BINGO").unwrap(),
+        );
+        assert_eq!(
+            out,
+            "<svg><p><style><!--</style><BINGO>--></style>
+            <math><p></p><style><!--</style><BINGO src onerror>--></style></math>"
+        );
+    }
+
+    #[test]
+    fn noscript_mode() {
+        let out = rewrite_element(
+            br#"<noscript><p alt="</noscript><img>">"#,
+            UTF_8,
+            "img",
+            |el| el.set_tag_name("we-have-scripts").unwrap(),
+        );
+        assert_eq!(out, r#"<noscript><p alt="</noscript><we-have-scripts>">"#);
+    }
+
+    #[test]
+    fn parse_error_in_foreign_content() {
+        let out = rewrite_element(
+            br#"<svg></p><style><a id="</style><img>">"#,
+            UTF_8,
+            "img,a",
+            |el| el.set_tag_name("HIT").unwrap(),
+        );
+        assert_eq!(out, r#"<svg></p><style><a id="</style><HIT>">"#);
+    }
+
+    #[test]
+    fn parse_error_in_foreign_content2() {
+        let out = rewrite_element(
+            br#"<math><br><style><a id="</style><img>">
+            <math><font kolor/><style><a/></style><body><style><a/></style></math>
+            <math><font COLOR/><style><a/></style>"#,
+            UTF_8,
+            "img,a",
+            |el| el.set_tag_name("HIT").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<math><br><style><a id="</style><HIT>">
+            <math><font kolor/><style><HIT/></style><body><style><a/></style></math>
+            <math><font COLOR/><style><a/></style>"#
+        );
+    }
+
+    #[test]
+    fn nested_html_namespace() {
+        let out = rewrite_element(
+            br#"<math><mtext><br/></mtext><style><a id="</style><img>">"#,
+            UTF_8,
+            "img,a",
+            |el| el.set_tag_name("HIT").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<math><mtext><br/></mtext><style><HIT id="</style><img>">"#
+        );
+    }
+
+    #[test]
+    fn self_closing_script() {
+        let out = rewrite_element(
+            br#"<svG><sCript/><img></script></svg>"#,
+            UTF_8,
+            "img",
+            |el| el.set_tag_name("HIT").unwrap(),
+        );
+        assert_eq!(out, r#"<svG><sCript/><HIT></script></svg>"#);
+    }
+
+    #[test]
+    fn surprise_text_integration_point() {
+        let out = rewrite_element(
+            br#"<math><annotation-xml encoding="nope/html"><style><img></style></annotation-xml></math>
+            <math><annotation-xml encoding="text/HTML"><style><img></style></annotation-xml></math>"#,
+            UTF_8,
+            "img",
+            |el| el.set_tag_name("XML").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<math><annotation-xml encoding="nope/html"><style><XML></style></annotation-xml></math>
+            <math><annotation-xml encoding="text/HTML"><style><img></style></annotation-xml></math>"#
+        );
+    }
+
+    #[test]
+    fn foreignobject() {
+        let out = rewrite_element(
+            br#"<svg><annotation-xml><foreignobject><style><!--</style><p id="--><img>">"#,
+            UTF_8,
+            "p,img",
+            |el| el.set_tag_name("HIT").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<svg><annotation-xml><foreignobject><style><!--</style><HIT id="--><img>">"#
+        );
+    }
+
+    #[test]
+    fn foreignobject2() {
+        let out = rewrite_element(
+            br#"<svg><a><foreignobject><a><table><a></table><style><!--</style></svg><a id="-><img>">"#,
+            UTF_8,
+            "a,img",
+            |el| el.set_tag_name("A").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<svg><A><foreignobject><A><table><A></A><style><!--</style></A><A id="-><img>">"#
+        );
+    }
+
+    #[test]
+    fn math_parse_error() {
+        let out = rewrite_element(
+            br#"<math><p></p><style><!--</style><img src/onerror>--></style></math>"#,
+            UTF_8,
+            "a,img",
+            |el| el.set_tag_name("A").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<math><p></p><style><!--</style><A src onerror>--></style></math>"#
+        );
+    }
+
+    #[test]
+    fn roundtrip_impossible() {
+        let out = rewrite_element(
+            br#"<form><math><mtext></form><form><mglyph><style></math><img>"#,
+            UTF_8,
+            "style,img",
+            |el| el.set_tag_name("no-img-here").unwrap(),
+        );
+        assert_eq!(
+            out,
+            r#"<form><math><mtext></form><form><mglyph><no-img-here></math><img>"#
+        );
+    }
+
+    #[test]
     fn forbidden_characters_in_tag_name() {
         rewrite_element(b"<div>", UTF_8, "div", |el| {
             for &ch in &[' ', '\n', '\r', '\t', '\x0C', '/', '>'] {
-                let err = el.set_tag_name(&format!("foo{}bar", ch)).unwrap_err();
+                let err = el.set_tag_name(&format!("foo{ch}bar")).unwrap_err();
 
                 assert_eq!(err, TagNameError::ForbiddenCharacter(ch));
             }
@@ -699,7 +1035,7 @@ mod tests {
     fn forbidden_characters_in_attr_name() {
         rewrite_element(b"<div>", UTF_8, "div", |el| {
             for &ch in &[' ', '\n', '\r', '\t', '\x0C', '/', '>', '='] {
-                let err = el.set_attribute(&format!("foo{}bar", ch), "").unwrap_err();
+                let err = el.set_attribute(&format!("foo{ch}bar"), "").unwrap_err();
 
                 assert_eq!(err, AttributeNameError::ForbiddenCharacter(ch));
             }
@@ -914,7 +1250,10 @@ mod tests {
             encoded("<div><span>Hi<inner-remove-me>RemoveŴ</inner-remove-me></span></div>")
         {
             let output = rewrite_element(&html, enc, "span", |el| {
-                el.prepend("<prepended>", ContentType::Html);
+                el.streaming_prepend(streaming!(|s| {
+                    s.write_utf8_chunk(b"<prepended>", ContentType::Html)?;
+                    Ok(())
+                }));
                 el.append("<appended>", ContentType::Html);
                 el.set_inner_content("<imgŵ>", ContentType::Html);
                 el.set_inner_content("<imgŵ>", ContentType::Text);
@@ -1048,7 +1387,17 @@ mod tests {
     #[test]
     fn self_closing_element() {
         let output = rewrite_element(b"<svg><foo/>Hi</foo></svg>", UTF_8, "foo", |el| {
-            el.after("<!--after-->", ContentType::Html);
+            el.after("->", ContentType::Html);
+            el.streaming_after(streaming!(|sink| {
+                sink.write_str("er-", ContentType::Html);
+                Ok(())
+            }));
+            el.after("t", ContentType::Html);
+            el.streaming_after(streaming!(|sink| {
+                sink.write_str("af", ContentType::Html);
+                Ok(())
+            }));
+            el.after("<!--", ContentType::Html);
             el.set_tag_name("bar").unwrap();
         });
 
@@ -1070,7 +1419,7 @@ mod tests {
 
     #[test]
     fn on_end_tag_handlers() {
-        let handler = |el: &mut Element| {
+        let handler = |el: &mut Element<'_, '_>| {
             el.end_tag_handlers().unwrap().push(Box::new(move |end| {
                 end.before("X", ContentType::Html);
                 Ok(())
@@ -1082,7 +1431,7 @@ mod tests {
             }));
         };
 
-        let res = rewrite_element("<div>foo</div>".as_bytes(), UTF_8, "div", handler);
+        let res = rewrite_element(b"<div>foo</div>", UTF_8, "div", handler);
 
         assert_eq!(res, "<div>fooXY</div>");
     }
@@ -1104,7 +1453,11 @@ mod tests {
         #[test]
         fn parsed() {
             test!(
-                |_| {},
+                |el| {
+                    assert_eq!(el.get_attribute("a1").unwrap(), "foo \" baré \" baz");
+                    assert_eq!(el.get_attribute("a3").unwrap(), "foo/bar");
+                    assert_eq!(el.get_attribute("a4").unwrap(), "");
+                },
                 r#"<a a1='foo " baré " baz' / a2="foo ' bar ' baz" a3=foo/bar a4></a>"#
             );
         }
@@ -1185,7 +1538,27 @@ mod tests {
                 el.remove_attribute("a1");
             });
 
-            assert_eq!(output, r#"<img/>"#);
+            assert_eq!(output, r"<img/>");
+        }
+
+        #[test]
+        fn value_trailing_slash() {
+            let mut output = rewrite_element(b"<img path=//>", UTF_8, "img", |el| {
+                assert_eq!(el.get_attribute("path").unwrap(), "//");
+                el.set_attribute("slash", "/").unwrap();
+
+                assert!(!el.can_have_content());
+            });
+
+            assert_eq!(output, r#"<img path=// slash="/">"#);
+
+            output = rewrite_element(b"<img path=//>", UTF_8, "img", |el| {
+                el.remove_attribute("path");
+
+                assert!(!el.can_have_content());
+            });
+
+            assert_eq!(output, r"<img>");
         }
 
         #[test]
@@ -1202,6 +1575,8 @@ mod tests {
         fn without_attrs() {
             test!(
                 |el| {
+                    assert!(el.can_have_content());
+
                     for name in &["a1", "a2", "a3", "a4"] {
                         el.remove_attribute(name);
                     }
@@ -1302,6 +1677,112 @@ mod tests {
                     assert!(el.removed());
                 },
                 "<before><foo & bar><after>"
+            );
+        }
+    }
+
+    mod location_spans {
+        use super::*;
+        use encoding_rs::WINDOWS_1252;
+
+        #[test]
+        fn tags() {
+            let raw_input = r"<html>
+                <div line=2>
+                    <a line=3><span line=3 />line 3</span></a>
+                </div>
+                ";
+            let output = rewrite_html(
+                raw_input.as_bytes(),
+                UTF_8,
+                vec![element!("*", |el: &mut Element<'_, '_>| {
+                    let loc = el.source_location();
+                    el.set_attribute("at", &loc.to_string()).unwrap();
+                    el.set_attribute("look", &raw_input[loc.bytes()]).unwrap();
+                    if let Some(end) = el.end_tag_handlers() {
+                        end.push(Box::new(|end| {
+                            let tag = &raw_input[end.source_location().bytes()];
+                            assert_eq!("</", &tag[0..2]);
+                            assert_eq!(b'>', *tag.as_bytes().last().unwrap());
+                            Ok(())
+                        }));
+                    }
+                    Ok(())
+                })],
+                vec![],
+            );
+
+            assert_eq!(
+                output,
+                r#"<html at="0B...6B" look="<html>">
+                <div line=2 at="23B...35B" look="<div line=2>">
+                    <a line=3 at="56B...66B" look="<a line=3>"><span line=3 at="66B...81B" look="<span line=3 />" />line 3</span></a>
+                </div>
+                "#
+            );
+        }
+
+        #[test]
+        fn text_and_comments() {
+            let mut raw_input = Vec::from(
+                br#"
+                <!doctype>
+                <html>l1
+                <meta charset="iso-8859-1">
+                l2 </>x
+                <p>l3</p><!-- l4 -->
+                <svg><![CDATA[
+                "#,
+            );
+            raw_input.extend(127..=255);
+            raw_input.extend_from_slice(
+                br"
+                l5
+                ]]></svg>
+                ",
+            );
+            let mut range_start = None;
+            let mut prev_range_end = 0;
+            let output = rewrite_html(
+                &raw_input,
+                WINDOWS_1252,
+                vec![],
+                vec![
+                    doc_comments!(|c| {
+                        let loc = c.source_location();
+                        let raw = &raw_input[loc.bytes()];
+                        assert_eq!(&raw[..4], b"<!--");
+                        assert_eq!(&raw[raw.len() - 3..], b"-->");
+                        c.set_text(&loc.to_string()).unwrap();
+                        Ok(())
+                    }),
+                    doc_text!(|t| {
+                        let loc = t.source_location().bytes();
+                        let start = *range_start.get_or_insert(loc.start);
+                        assert!(loc.start >= start);
+                        assert!(loc.end >= start);
+                        assert!(loc.start >= prev_range_end);
+                        assert!(loc.end >= prev_range_end);
+                        prev_range_end = loc.end;
+
+                        assert!(raw_input[start..loc.end]
+                            .iter()
+                            .all(|&b| b != b'<' && b != b'>'));
+
+                        if t.last_in_text_node() {
+                            t.set_str(format!("{start}..{}\n", loc.end));
+                            range_start = None;
+                        } else {
+                            t.remove();
+                        }
+                        Ok(())
+                    }),
+                ],
+            );
+
+            assert_eq!(
+                output,
+                "0..17\n<!doctype>27..44\n<html>50..69\n<meta charset=\"iso-8859-1\">96..116\n</>119..137\n<p>140..142\n</p><!--146B...157B-->157..174\n<svg><![CDATA[188..370\n]]></svg>379..396\n",
             );
         }
     }

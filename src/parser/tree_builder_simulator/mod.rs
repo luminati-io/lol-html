@@ -14,34 +14,37 @@
 mod ambiguity_guard;
 
 use self::ambiguity_guard::AmbiguityGuard;
-use crate::base::Bytes;
 use crate::html::{LocalNameHash, Namespace, Tag, TextType};
 use crate::parser::{TagLexeme, TagTokenOutline};
-use TagTokenOutline::*;
+use TagTokenOutline::{EndTag, StartTag};
 
 pub use self::ambiguity_guard::ParsingAmbiguityError;
 
 const DEFAULT_NS_STACK_CAPACITY: usize = 256;
 
 #[must_use]
-pub enum TreeBuilderFeedback {
+pub(crate) enum TreeBuilderFeedback {
     SwitchTextType(TextType),
     SetAllowCdata(bool),
     #[allow(clippy::type_complexity)]
-    RequestLexeme(Box<dyn FnMut(&mut TreeBuilderSimulator, &TagLexeme) -> TreeBuilderFeedback>),
+    RequestLexeme(
+        Box<dyn FnMut(&mut TreeBuilderSimulator, &TagLexeme<'_>) -> TreeBuilderFeedback + Send>,
+    ),
     None,
 }
 
 impl From<TextType> for TreeBuilderFeedback {
     #[inline]
     fn from(text_type: TextType) -> Self {
-        TreeBuilderFeedback::SwitchTextType(text_type)
+        Self::SwitchTextType(text_type)
     }
 }
 
 #[inline]
 fn request_lexeme(
-    callback: impl FnMut(&mut TreeBuilderSimulator, &TagLexeme) -> TreeBuilderFeedback + 'static,
+    callback: impl FnMut(&mut TreeBuilderSimulator, &TagLexeme<'_>) -> TreeBuilderFeedback
+        + 'static
+        + Send,
 ) -> TreeBuilderFeedback {
     TreeBuilderFeedback::RequestLexeme(Box::new(callback))
 }
@@ -55,8 +58,9 @@ macro_rules! expect_tag {
     };
 }
 
+/// Unlike eq_ignore_ascii_case it only lowercases `actual`
 #[inline]
-fn eq_case_insensitive(actual: &Bytes, expected: &[u8]) -> bool {
+fn eq_case_insensitive(actual: &[u8], expected: &[u8]) -> bool {
     if actual.len() != expected.len() {
         return false;
     }
@@ -110,7 +114,7 @@ fn is_html_integration_point_in_svg(tag_name: LocalNameHash) -> bool {
 }
 
 // TODO limit ns stack
-pub struct TreeBuilderSimulator {
+pub(crate) struct TreeBuilderSimulator {
     ns_stack: Vec<Namespace>,
     current_ns: Namespace,
     ambiguity_guard: AmbiguityGuard,
@@ -118,8 +122,10 @@ pub struct TreeBuilderSimulator {
 }
 
 impl TreeBuilderSimulator {
+    #[inline]
+    #[must_use]
     pub fn new(strict: bool) -> Self {
-        let mut simulator = TreeBuilderSimulator {
+        let mut simulator = Self {
             ns_stack: Vec::with_capacity(DEFAULT_NS_STACK_CAPACITY),
             current_ns: Namespace::Html,
             ambiguity_guard: AmbiguityGuard::default(),
@@ -157,17 +163,31 @@ impl TreeBuilderSimulator {
 
         if self.current_ns == Namespace::Html {
             self.check_integration_point_exit(tag_name)
-        } else if self.current_ns == Namespace::Svg && tag_name == Tag::Svg
-            || self.current_ns == Namespace::MathML && tag_name == Tag::Math
-        {
+        } else if self.should_leave_ns(tag_name) {
             self.leave_ns()
         } else {
             TreeBuilderFeedback::None
         }
     }
 
+    fn should_leave_ns(&self, tag_name: LocalNameHash) -> bool {
+        if self.current_ns == Namespace::Svg && tag_name == Tag::Svg
+            || self.current_ns == Namespace::MathML && tag_name == Tag::Math
+        {
+            return true;
+        }
+
+        if (self.current_ns == Namespace::Svg || self.current_ns == Namespace::MathML)
+            && tag_is_one_of!(tag_name, [P, Br])
+        {
+            // 13.2.6.5
+            return true;
+        }
+        false
+    }
+
     #[inline]
-    pub fn current_ns(&self) -> Namespace {
+    pub const fn current_ns(&self) -> Namespace {
         self.current_ns
     }
 
@@ -250,7 +270,7 @@ impl TreeBuilderSimulator {
             // to decide on foreign context exit
             return request_lexeme(|this, lexeme| {
                 expect_tag!(lexeme, StartTag { ref attributes, .. } => {
-                    for attr in attributes.borrow().iter() {
+                    for attr in attributes {
                         let name = lexeme.part(attr.name);
 
                         if eq_case_insensitive(&name, b"color")
@@ -279,7 +299,7 @@ impl TreeBuilderSimulator {
                     let name = lexeme.part(name);
 
                     if !self_closing && eq_case_insensitive(&name, b"annotation-xml") {
-                        for attr in attributes.borrow().iter() {
+                        for attr in attributes {
                             let name = lexeme.part(attr.name);
                             let value = lexeme.part(attr.value);
 

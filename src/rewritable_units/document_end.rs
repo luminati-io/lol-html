@@ -1,5 +1,4 @@
-use super::mutations::content_to_bytes;
-use super::ContentType;
+use super::{ContentType, StreamingHandlerSink};
 use encoding_rs::Encoding;
 
 use crate::transform_stream::OutputSink;
@@ -15,6 +14,8 @@ pub struct DocumentEnd<'a> {
 }
 
 impl<'a> DocumentEnd<'a> {
+    #[inline]
+    #[must_use]
     pub(crate) fn new(output_sink: &'a mut dyn OutputSink, encoding: &'static Encoding) -> Self {
         DocumentEnd {
             output_sink,
@@ -40,7 +41,7 @@ impl<'a> DocumentEnd<'a> {
     ///             end.append("<baz>", ContentType::Text);
     ///             Ok(())
     ///         })],
-    ///         ..RewriteStrSettings::default()
+    ///         ..RewriteStrSettings::new()
     ///     }
     /// ).unwrap();
     ///
@@ -48,9 +49,10 @@ impl<'a> DocumentEnd<'a> {
     /// ```
     #[inline]
     pub fn append(&mut self, content: &str, content_type: ContentType) {
-        content_to_bytes(content, content_type, self.encoding, &mut |c: &[u8]| {
-            self.output_sink.handle_chunk(c)
-        });
+        StreamingHandlerSink::new(self.encoding, &mut |c| {
+            self.output_sink.handle_chunk(c);
+        })
+        .write_str(content, content_type);
     }
 }
 
@@ -64,7 +66,7 @@ mod tests {
     fn rewrite_on_end(
         html: &[u8],
         encoding: &'static Encoding,
-        mut handler: impl FnMut(&mut DocumentEnd),
+        mut handler: impl FnMut(&mut DocumentEnd<'_>),
     ) -> String {
         let mut handler_called = false;
 
@@ -91,7 +93,7 @@ mod tests {
             end.append("<div></div>", ContentType::Html);
         });
 
-        assert_eq!(output, "<div></div>")
+        assert_eq!(output, "<div></div>");
     }
 
     #[test]

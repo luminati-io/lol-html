@@ -10,7 +10,7 @@ use crate::rewriter::RewritingError;
 use std::fmt::{self, Debug};
 use std::mem;
 
-pub enum FeedbackDirective {
+pub(crate) enum FeedbackDirective {
     ApplyUnhandledFeedback(TreeBuilderFeedback),
     Skip,
     None,
@@ -18,27 +18,28 @@ pub enum FeedbackDirective {
 
 impl FeedbackDirective {
     #[inline]
-    pub fn take(&mut self) -> FeedbackDirective {
-        mem::replace(self, FeedbackDirective::None)
+    pub fn take(&mut self) -> Self {
+        mem::replace(self, Self::None)
     }
 }
 
 impl Debug for FeedbackDirective {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
             match self {
-                FeedbackDirective::ApplyUnhandledFeedback(_) => "ApplyPendingFeedback",
-                FeedbackDirective::Skip => "Skip",
-                FeedbackDirective::None => "None",
+                Self::ApplyUnhandledFeedback(_) => "ApplyPendingFeedback",
+                Self::Skip => "Skip",
+                Self::None => "None",
             }
         )
     }
 }
 
 #[derive(Debug)]
-pub struct StateMachineBookmark {
+pub(crate) struct StateMachineBookmark {
     cdata_allowed: bool,
     text_type: TextType,
     last_start_tag_name_hash: LocalNameHash,
@@ -47,15 +48,15 @@ pub struct StateMachineBookmark {
     feedback_directive: FeedbackDirective,
 }
 
-pub enum ActionError {
+pub(crate) enum ActionError {
     RewritingError(RewritingError),
     ParserDirectiveChangeRequired(ParserDirective, StateMachineBookmark),
 }
 
 impl From<ParsingAmbiguityError> for ActionError {
-    #[inline]
+    #[cold]
     fn from(err: ParsingAmbiguityError) -> Self {
-        ActionError::RewritingError(RewritingError::ParsingAmbiguity(err))
+        Self::RewritingError(RewritingError::ParsingAmbiguity(err))
     }
 }
 
@@ -71,55 +72,71 @@ pub type ActionResult = Result<(), ActionError>;
 pub type StateResult = Result<(), ParsingTermination>;
 pub type ParseResult = Result<Never, ParsingTermination>;
 
-pub trait StateMachineActions {
-    fn emit_eof(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_text(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_current_token(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_tag(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_current_token_and_eof(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_raw_without_token(&mut self, input: &[u8]) -> ActionResult;
-    fn emit_raw_without_token_and_eof(&mut self, input: &[u8]) -> ActionResult;
+pub(crate) trait StateMachineActions {
+    type Context;
 
-    fn create_start_tag(&mut self, input: &[u8]);
-    fn create_end_tag(&mut self, input: &[u8]);
-    fn create_doctype(&mut self, input: &[u8]);
-    fn create_comment(&mut self, input: &[u8]);
+    fn emit_eof(&mut self, context: &mut Self::Context, input: &[u8]) -> ActionResult;
+    fn emit_text(&mut self, context: &mut Self::Context, input: &[u8]) -> ActionResult;
+    fn emit_current_token(&mut self, context: &mut Self::Context, input: &[u8]) -> ActionResult;
+    fn emit_tag(&mut self, context: &mut Self::Context, input: &[u8]) -> ActionResult;
+    fn emit_current_token_and_eof(
+        &mut self,
+        context: &mut Self::Context,
+        input: &[u8],
+    ) -> ActionResult;
+    fn emit_raw_without_token(&mut self, context: &mut Self::Context, input: &[u8])
+        -> ActionResult;
+    fn emit_raw_without_token_and_eof(
+        &mut self,
+        context: &mut Self::Context,
+        input: &[u8],
+    ) -> ActionResult;
 
-    fn start_token_part(&mut self, input: &[u8]);
+    fn create_start_tag(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn create_end_tag(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn create_doctype(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn create_comment(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn mark_comment_text_end(&mut self, input: &[u8]);
-    fn shift_comment_text_end_by(&mut self, input: &[u8], offset: usize);
+    fn start_token_part(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn set_force_quirks(&mut self, input: &[u8]);
-    fn finish_doctype_name(&mut self, input: &[u8]);
-    fn finish_doctype_public_id(&mut self, input: &[u8]);
-    fn finish_doctype_system_id(&mut self, input: &[u8]);
+    fn mark_comment_text_end(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn shift_comment_text_end_by(
+        &mut self,
+        context: &mut Self::Context,
+        input: &[u8],
+        offset: usize,
+    );
 
-    fn finish_tag_name(&mut self, input: &[u8]) -> ActionResult;
-    fn update_tag_name_hash(&mut self, input: &[u8]);
-    fn mark_as_self_closing(&mut self, input: &[u8]);
+    fn set_force_quirks(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_doctype_name(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_doctype_public_id(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_doctype_system_id(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn start_attr(&mut self, input: &[u8]);
-    fn finish_attr_name(&mut self, input: &[u8]);
-    fn finish_attr_value(&mut self, input: &[u8]);
-    fn finish_attr(&mut self, input: &[u8]);
+    fn finish_tag_name(&mut self, context: &mut Self::Context, input: &[u8]) -> ActionResult;
+    fn update_tag_name_hash(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn mark_as_self_closing(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn set_closing_quote_to_double(&mut self, input: &[u8]);
-    fn set_closing_quote_to_single(&mut self, input: &[u8]);
+    fn start_attr(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_attr_name(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_attr_value(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn finish_attr(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn mark_tag_start(&mut self, input: &[u8]);
-    fn unmark_tag_start(&mut self, input: &[u8]);
+    fn set_closing_quote_to_double(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn set_closing_quote_to_single(&mut self, context: &mut Self::Context, input: &[u8]);
 
-    fn enter_cdata(&mut self, input: &[u8]);
-    fn leave_cdata(&mut self, input: &[u8]);
+    fn mark_tag_start(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn unmark_tag_start(&mut self, context: &mut Self::Context, input: &[u8]);
+
+    fn enter_cdata(&mut self, context: &mut Self::Context, input: &[u8]);
+    fn leave_cdata(&mut self, context: &mut Self::Context, input: &[u8]);
 }
 
-pub trait StateMachineConditions {
+pub(crate) trait StateMachineConditions {
     fn is_appropriate_end_tag(&self) -> bool;
     fn cdata_allowed(&self) -> bool;
 }
 
-pub trait StateMachine: StateMachineActions + StateMachineConditions {
+pub(crate) trait StateMachine: StateMachineActions + StateMachineConditions {
     cdata_section_states_group!();
     data_states_group!();
     plaintext_states_group!();
@@ -133,8 +150,11 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
     comment_states_group!();
     doctype_states_group!();
 
-    fn state(&self) -> fn(&mut Self, &[u8]) -> StateResult;
-    fn set_state(&mut self, state: fn(&mut Self, &[u8]) -> StateResult);
+    fn state(&self) -> fn(&mut Self, context: &mut Self::Context, &[u8]) -> StateResult;
+    fn set_state(
+        &mut self,
+        state: fn(&mut Self, context: &mut Self::Context, &[u8]) -> StateResult,
+    );
 
     fn is_state_enter(&self) -> bool;
     fn set_is_state_enter(&mut self, val: bool);
@@ -164,16 +184,22 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
     fn is_last_input(&self) -> bool;
     fn set_is_last_input(&mut self, last: bool);
 
-    fn run_parsing_loop(&mut self, input: &[u8], last: bool) -> ParseResult {
+    fn run_parsing_loop(
+        &mut self,
+        context: &mut Self::Context,
+        input: &[u8],
+        last: bool,
+    ) -> ParseResult {
         self.set_is_last_input(last);
 
         loop {
-            self.state()(self, input)?;
+            self.state()(self, context, input)?;
         }
     }
 
     fn continue_from_bookmark(
         &mut self,
+        context: &mut Self::Context,
         input: &[u8],
         last: bool,
         bookmark: StateMachineBookmark,
@@ -184,7 +210,7 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
         self.adjust_to_bookmark(bookmark.pos, bookmark.feedback_directive);
         self.set_pos(bookmark.pos);
 
-        self.run_parsing_loop(input, last)
+        self.run_parsing_loop(context, input, last)
     }
 
     #[inline]
@@ -192,7 +218,7 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
         let consumed_byte_count = self.get_consumed_byte_count(input);
 
         if !self.is_last_input() {
-            self.adjust_for_next_input()
+            self.adjust_for_next_input();
         }
 
         self.set_pos(self.pos() - consumed_byte_count);
@@ -231,7 +257,7 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
     }
 
     #[inline]
-    fn switch_state(&mut self, state: fn(&mut Self, &[u8]) -> StateResult) {
+    fn switch_state(&mut self, state: fn(&mut Self, &mut Self::Context, &[u8]) -> StateResult) {
         self.set_state(state);
         self.set_is_state_enter(true);
     }
@@ -243,7 +269,7 @@ pub trait StateMachine: StateMachineActions + StateMachineConditions {
     }
 
     #[inline]
-    fn next_text_parsing_state(&self) -> fn(&mut Self, &[u8]) -> StateResult {
+    fn next_text_parsing_state(&self) -> fn(&mut Self, &mut Self::Context, &[u8]) -> StateResult {
         match self.last_text_type() {
             TextType::Data => Self::data_state,
             TextType::PlainText => Self::plaintext_state,
@@ -302,22 +328,22 @@ macro_rules! impl_common_sm_accessors {
 macro_rules! impl_common_sm_actions {
     () => {
         #[inline]
-        fn set_closing_quote_to_double(&mut self, _input: &[u8]) {
+        fn set_closing_quote_to_double(&mut self, _context: &mut Self::Context, _input: &[u8]) {
             self.closing_quote = b'"';
         }
 
         #[inline]
-        fn set_closing_quote_to_single(&mut self, _input: &[u8]) {
+        fn set_closing_quote_to_single(&mut self, _context: &mut Self::Context, _input: &[u8]) {
             self.closing_quote = b'\'';
         }
 
         #[inline]
-        fn enter_cdata(&mut self, _input: &[u8]) {
+        fn enter_cdata(&mut self, _context: &mut Self::Context, _input: &[u8]) {
             self.set_last_text_type(TextType::CDataSection);
         }
 
         #[inline]
-        fn leave_cdata(&mut self, _input: &[u8]) {
+        fn leave_cdata(&mut self, _context: &mut Self::Context, _input: &[u8]) {
             self.set_last_text_type(TextType::Data);
         }
     };
@@ -387,7 +413,7 @@ macro_rules! noop_action {
     ($($fn_name:ident),*) => {
         $(
             #[inline]
-            fn $fn_name(&mut self, _input: &[u8]) {
+            fn $fn_name(&mut self, _context: &mut Self::Context, _input: &[u8]) {
                 trace!(@noop);
             }
         )*
@@ -398,7 +424,7 @@ macro_rules! noop_action_with_result {
     ($($fn_name:ident),*) => {
         $(
             #[inline]
-            fn $fn_name(&mut self, _input: &[u8]) -> ActionResult {
+            fn $fn_name(&mut self, _context: &mut Self::Context, _input: &[u8]) -> ActionResult {
                 trace!(@noop);
 
                 Ok(())

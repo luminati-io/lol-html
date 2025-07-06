@@ -1,9 +1,9 @@
-use criterion::*;
+use criterion::{criterion_group, criterion_main};
 use glob::glob;
-use lazy_static::lazy_static;
 use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::Read;
+use std::sync::LazyLock;
 
 const CHUNK_SIZE: usize = 1024;
 
@@ -14,35 +14,33 @@ struct Input {
 }
 
 impl Debug for Input {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name)
     }
 }
 
-lazy_static! {
-    static ref INPUTS: Vec<Input> = {
-        glob("benches/data/*.html")
-            .unwrap()
-            .map(|path| {
-                let mut data = String::new();
-                let path = path.unwrap();
+static INPUTS: LazyLock<Vec<Input>> = LazyLock::new(|| {
+    glob("benches/data/*.html")
+        .unwrap()
+        .map(|path| {
+            let mut data = String::new();
+            let path = path.unwrap();
 
-                File::open(&path)
-                    .unwrap()
-                    .read_to_string(&mut data)
-                    .unwrap();
+            File::open(&path)
+                .unwrap()
+                .read_to_string(&mut data)
+                .unwrap();
 
-                let data = data.into_bytes();
+            let data = data.into_bytes();
 
-                Input {
-                    name: path.file_name().unwrap().to_string_lossy().to_string(),
-                    length: data.len(),
-                    chunks: data.chunks(CHUNK_SIZE).map(|c| c.to_owned()).collect(),
-                }
-            })
-            .collect()
-    };
-}
+            Input {
+                name: path.file_name().unwrap().to_string_lossy().to_string(),
+                length: data.len(),
+                chunks: data.chunks(CHUNK_SIZE).map(|c| c.to_owned()).collect(),
+            }
+        })
+        .collect()
+});
 
 macro_rules! create_runner {
     ($settings:expr) => {

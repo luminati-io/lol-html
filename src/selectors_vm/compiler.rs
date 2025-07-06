@@ -4,7 +4,7 @@ use super::{
     Ast, AstNode, AttributeComparisonExpr, Expr, OnAttributesExpr, OnTagNameExpr, Predicate,
     SelectorState,
 };
-use crate::base::{Bytes, HasReplacementsError};
+use crate::base::{BytesCow, HasReplacementsError};
 use crate::html::LocalName;
 use encoding_rs::Encoding;
 use selectors::attr::{AttrSelectorOperator, ParsedCaseSensitivity};
@@ -12,10 +12,13 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter;
 
+type BytesOwned = Box<[u8]>;
+
 /// An expression using only the tag name of an element.
-pub type CompiledLocalNameExpr = Box<dyn Fn(&SelectorState, &LocalName) -> bool>;
+pub type CompiledLocalNameExpr = Box<dyn Fn(&SelectorState<'_>, &LocalName<'_>) -> bool + Send>;
 /// An expression using the attributes of an element.
-pub type CompiledAttributeExpr = Box<dyn Fn(&SelectorState, &AttributeMatcher) -> bool>;
+pub type CompiledAttributeExpr =
+    Box<dyn Fn(&SelectorState<'_>, &AttributeMatcher<'_>) -> bool + Send>;
 
 #[derive(Default)]
 struct ExprSet {
@@ -23,15 +26,15 @@ struct ExprSet {
     pub attribute_exprs: Vec<CompiledAttributeExpr>,
 }
 
-pub struct AttrExprOperands {
-    pub name: Bytes<'static>,
-    pub value: Bytes<'static>,
+pub(crate) struct AttrExprOperands {
+    pub name: BytesOwned,
+    pub value: BytesOwned,
     pub case_sensitivity: ParsedCaseSensitivity,
 }
 
 impl Expr<OnTagNameExpr> {
     #[inline]
-    pub fn compile_expr<F: Fn(&SelectorState, &LocalName) -> bool + 'static>(
+    pub fn compile_expr<F: Fn(&SelectorState<'_>, &LocalName<'_>) -> bool + Send + 'static>(
         &self,
         f: F,
     ) -> CompiledLocalNameExpr {
@@ -92,7 +95,9 @@ impl Compilable for Expr<OnTagNameExpr> {
 
 impl Expr<OnAttributesExpr> {
     #[inline]
-    pub fn compile_expr<F: Fn(&SelectorState, &AttributeMatcher) -> bool + 'static>(
+    pub fn compile_expr<
+        F: Fn(&SelectorState<'_>, &AttributeMatcher<'_>) -> bool + Send + 'static,
+    >(
         &self,
         f: F,
     ) -> CompiledAttributeExpr {
@@ -108,15 +113,15 @@ impl Expr<OnAttributesExpr> {
 fn compile_literal(
     encoding: &'static Encoding,
     lit: &str,
-) -> Result<Bytes<'static>, HasReplacementsError> {
-    Bytes::from_str_without_replacements(lit, encoding).map(Bytes::into_owned)
+) -> Result<BytesOwned, HasReplacementsError> {
+    Ok(BytesCow::from_str_without_replacements(lit, encoding)?.into())
 }
 
 #[inline]
 fn compile_literal_lowercase(
     encoding: &'static Encoding,
     lit: &str,
-) -> Result<Bytes<'static>, HasReplacementsError> {
+) -> Result<BytesOwned, HasReplacementsError> {
     compile_literal(encoding, &lit.to_ascii_lowercase())
 }
 
@@ -125,7 +130,7 @@ fn compile_operands(
     encoding: &'static Encoding,
     name: &str,
     value: &str,
-) -> Result<(Bytes<'static>, Bytes<'static>), HasReplacementsError> {
+) -> Result<(BytesOwned, BytesOwned), HasReplacementsError> {
     Ok((
         compile_literal_lowercase(encoding, name)?,
         compile_literal(encoding, value)?,
@@ -184,7 +189,7 @@ impl Compilable for Expr<OnAttributesExpr> {
     }
 }
 
-pub struct Compiler<P>
+pub(crate) struct Compiler<P>
 where
     P: PartialEq + Eq + Copy + Debug + Hash,
 {
@@ -197,8 +202,9 @@ impl<P: 'static> Compiler<P>
 where
     P: PartialEq + Eq + Copy + Debug + Hash,
 {
+    #[must_use]
     pub fn new(encoding: &'static Encoding) -> Self {
-        Compiler {
+        Self {
             encoding,
             instructions: Default::default(),
             free_space_start: 0,
@@ -216,12 +222,12 @@ where
     ) -> Instruction<P> {
         let mut exprs = ExprSet::default();
 
-        on_tag_name_exprs
-            .iter()
-            .for_each(|c| c.compile(self.encoding, &mut exprs, enable_nth_of_type));
-        on_attr_exprs
-            .iter()
-            .for_each(|c| c.compile(self.encoding, &mut exprs, enable_nth_of_type));
+        for c in on_tag_name_exprs {
+            c.compile(self.encoding, &mut exprs, enable_nth_of_type);
+        }
+        for c in on_attr_exprs {
+            c.compile(self.encoding, &mut exprs, enable_nth_of_type);
+        }
 
         let ExprSet {
             local_name_exprs,
@@ -288,6 +294,11 @@ where
         addr_range
     }
 
+    // generic methods tend to be inlined, but this one is called from a couple of places,
+    // and has cheap-to-pass non-constants args, so it won't benefit from being merged into its callers.
+    // It's better to outline it, and let its callers be inlined.
+    #[must_use]
+    #[inline(never)]
     pub fn compile(mut self, ast: Ast<P>) -> Program<P> {
         let mut enable_nth_of_type = false;
         self.instructions = iter::repeat_with(|| None)
@@ -370,7 +381,7 @@ mod tests {
         vec![
             (selector.to_string(), test_cases.to_owned()),
             (
-                format!(":not({})", selector),
+                format!(":not({selector})"),
                 test_cases
                     .iter()
                     .map(|(input, should_match)| (*input, !should_match))
@@ -382,13 +393,13 @@ mod tests {
     fn with_start_tag(
         html: &str,
         encoding: &'static Encoding,
-        mut action: impl FnMut(LocalName, AttributeMatcher),
+        mut action: impl FnMut(LocalName<'_>, AttributeMatcher<'_>),
     ) {
         test_with_token(html, encoding, |t| match t {
             Token::StartTag(t) => {
                 let (input, attrs) = t.raw_attributes();
                 let tag_name = t.name();
-                let attr_matcher = AttributeMatcher::new(input, attrs, Namespace::Html);
+                let attr_matcher = AttributeMatcher::new(*input, attrs, Namespace::Html);
                 let local_name =
                     LocalName::from_str_without_replacements(&tag_name, encoding).unwrap();
 
@@ -401,9 +412,9 @@ mod tests {
     fn for_each_test_case<T>(
         test_cases: &[(&str, T)],
         encoding: &'static Encoding,
-        action: impl Fn(&str, &T, &SelectorState, LocalName, AttributeMatcher),
+        action: impl Fn(&str, &T, &SelectorState<'_>, LocalName<'_>, AttributeMatcher<'_>),
     ) {
-        for (input, matching_data) in test_cases.iter() {
+        for (input, matching_data) in test_cases {
             with_start_tag(input, encoding, |local_name, attr_matcher| {
                 let counter = Default::default();
                 let state = SelectorState {
@@ -481,7 +492,7 @@ mod tests {
         encoding: &'static Encoding,
         test_cases: &[(&str, bool)],
     ) {
-        for (selector, test_cases) in with_negated(selector, test_cases).iter() {
+        for (selector, test_cases) in &with_negated(selector, test_cases) {
             assert_attr_expr_matches(selector, encoding, test_cases);
         }
     }
@@ -599,7 +610,7 @@ mod tests {
 
     #[test]
     fn compiled_non_attr_expression() {
-        for encoding in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for encoding in &ASCII_COMPATIBLE_ENCODINGS {
             assert_non_attr_expr_matches_and_negation_reverses_match(
                 "*",
                 encoding,
@@ -608,16 +619,6 @@ mod tests {
                     ("<span>", true),
                     ("<anything-else>", true),
                     ("<FуБар>", true),
-                ],
-            );
-
-            assert_non_attr_expr_matches_and_negation_reverses_match(
-                r#"[foo*=""]"#,
-                encoding,
-                &[
-                    ("<div>", false),
-                    ("<span>", false),
-                    ("<anything-else>", false),
                 ],
             );
 
@@ -665,7 +666,7 @@ mod tests {
 
     #[test]
     fn compiled_attr_expression() {
-        for encoding in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for encoding in &ASCII_COMPATIBLE_ENCODINGS {
             assert_attr_expr_matches_and_negation_reverses_match(
                 "#foo⾕",
                 encoding,
@@ -720,6 +721,16 @@ mod tests {
                     ("<div foo='BaRα'>", true),
                     ("<div foo='42'>", false),
                     ("<div bar=baz qux>", false),
+                ],
+            );
+
+            assert_attr_expr_matches_and_negation_reverses_match(
+                r#"[foo*=""]"#,
+                encoding,
+                &[
+                    ("<div>", false),
+                    ("<span>", false),
+                    ("<anything-else>", false),
                 ],
             );
 
@@ -884,7 +895,7 @@ mod tests {
 
     #[test]
     fn generic_expressions() {
-        for encoding in ASCII_COMPATIBLE_ENCODINGS.iter() {
+        for encoding in &ASCII_COMPATIBLE_ENCODINGS {
             assert_generic_expr_matches(
                 r#"div#foo1.c1.c2[foo3੦][foo2$="bar"]"#,
                 encoding,
@@ -914,7 +925,7 @@ mod tests {
             );
 
             assert_generic_expr_matches(
-                r#"some-thing[lang|=en]"#,
+                r"some-thing[lang|=en]",
                 encoding,
                 &[
                     ("<some-thing lang='en-GB'", true),

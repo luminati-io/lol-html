@@ -4,7 +4,7 @@ use crate::rewritable_units::{DocumentEnd, Element, StartTag, Token, TokenCaptur
 use crate::selectors_vm::MatchInfo;
 
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
-pub struct SelectorHandlersLocator {
+pub(crate) struct SelectorHandlersLocator {
     pub element_handler_idx: Option<usize>,
     pub comment_handler_idx: Option<usize>,
     pub text_handler_idx: Option<usize>,
@@ -22,7 +22,7 @@ struct HandlerVec<H> {
 
 impl<H> Default for HandlerVec<H> {
     fn default() -> Self {
-        HandlerVec {
+        Self {
             items: Vec::default(),
             user_count: 0,
         }
@@ -59,7 +59,7 @@ impl<H> HandlerVec<H> {
     }
 
     #[inline]
-    pub fn has_active(&self) -> bool {
+    pub const fn has_active(&self) -> bool {
         self.user_count > 0
     }
 
@@ -68,7 +68,7 @@ impl<H> HandlerVec<H> {
         &mut self,
         mut cb: impl FnMut(&mut H) -> HandlerResult,
     ) -> HandlerResult {
-        for item in self.items.iter_mut() {
+        for item in &mut self.items {
             if item.user_count > 0 {
                 cb(&mut item.handler)?;
             }
@@ -82,7 +82,7 @@ impl<H> HandlerVec<H> {
         &mut self,
         mut cb: impl FnMut(&mut H) -> HandlerResult,
     ) -> HandlerResult {
-        for item in self.items.iter_mut() {
+        for item in &mut self.items {
             if item.user_count > 0 {
                 cb(&mut item.handler)?;
                 self.user_count -= item.user_count;
@@ -112,21 +112,35 @@ impl<H> HandlerVec<H> {
     }
 }
 
-#[derive(Default)]
-pub struct ContentHandlersDispatcher<'h> {
-    doctype_handlers: HandlerVec<DoctypeHandler<'h>>,
-    comment_handlers: HandlerVec<CommentHandler<'h>>,
-    text_handlers: HandlerVec<TextHandler<'h>>,
-    end_tag_handlers: HandlerVec<EndTagHandler<'h>>,
-    element_handlers: HandlerVec<ElementHandler<'h>>,
-    end_handlers: HandlerVec<EndHandler<'h>>,
+pub(crate) struct ContentHandlersDispatcher<'h, H: HandlerTypes> {
+    doctype_handlers: HandlerVec<H::DoctypeHandler<'h>>,
+    comment_handlers: HandlerVec<H::CommentHandler<'h>>,
+    text_handlers: HandlerVec<H::TextHandler<'h>>,
+    end_tag_handlers: HandlerVec<H::EndTagHandler<'static>>,
+    element_handlers: HandlerVec<H::ElementHandler<'h>>,
+    end_handlers: HandlerVec<H::EndHandler<'h>>,
     next_element_can_have_content: bool,
     matched_elements_with_removed_content: usize,
 }
 
-impl<'h> ContentHandlersDispatcher<'h> {
+impl<H: HandlerTypes> Default for ContentHandlersDispatcher<'_, H> {
+    fn default() -> Self {
+        ContentHandlersDispatcher {
+            doctype_handlers: Default::default(),
+            comment_handlers: Default::default(),
+            text_handlers: Default::default(),
+            end_tag_handlers: Default::default(),
+            element_handlers: Default::default(),
+            end_handlers: Default::default(),
+            next_element_can_have_content: false,
+            matched_elements_with_removed_content: 0,
+        }
+    }
+}
+
+impl<'h, H: HandlerTypes> ContentHandlersDispatcher<'h, H> {
     #[inline]
-    pub fn add_document_content_handlers(&mut self, handlers: DocumentContentHandlers<'h>) {
+    pub fn add_document_content_handlers(&mut self, handlers: DocumentContentHandlers<'h, H>) {
         if let Some(handler) = handlers.doctype {
             self.doctype_handlers.push(handler, true);
         }
@@ -147,7 +161,7 @@ impl<'h> ContentHandlersDispatcher<'h> {
     #[inline]
     pub fn add_selector_associated_handlers(
         &mut self,
-        handlers: ElementContentHandlers<'h>,
+        handlers: ElementContentHandlers<'h, H>,
     ) -> SelectorHandlersLocator {
         SelectorHandlersLocator {
             element_handler_idx: handlers.element.map(|h| {
@@ -166,12 +180,12 @@ impl<'h> ContentHandlersDispatcher<'h> {
     }
 
     #[inline]
-    pub fn has_matched_elements_with_removed_content(&self) -> bool {
+    pub const fn has_matched_elements_with_removed_content(&self) -> bool {
         self.matched_elements_with_removed_content > 0
     }
 
     #[inline]
-    pub fn start_matching(&mut self, match_info: MatchInfo<SelectorHandlersLocator>) {
+    pub fn start_matching(&mut self, match_info: &MatchInfo<SelectorHandlersLocator>) {
         let locator = match_info.payload;
 
         if match_info.with_content {
@@ -214,11 +228,11 @@ impl<'h> ContentHandlersDispatcher<'h> {
 
     pub fn handle_start_tag(
         &mut self,
-        start_tag: &mut StartTag,
+        start_tag: &mut StartTag<'_>,
         current_element_data: Option<&mut ElementDescriptor>,
     ) -> HandlerResult {
         if self.matched_elements_with_removed_content > 0 {
-            start_tag.mutations.remove();
+            start_tag.remove();
         }
 
         let mut element = Element::new(start_tag, self.next_element_can_have_content);
@@ -233,6 +247,7 @@ impl<'h> ContentHandlersDispatcher<'h> {
                     self.matched_elements_with_removed_content += 1;
                 }
 
+                debug_assert!(element.can_have_content());
                 if let Some(handler) = element.into_end_tag_handler() {
                     elem_desc.end_tag_handler_idx = Some(self.end_tag_handlers.len());
 
@@ -246,7 +261,7 @@ impl<'h> ContentHandlersDispatcher<'h> {
 
     pub fn handle_token(
         &mut self,
-        token: &mut Token,
+        token: &mut Token<'_>,
         current_element_data: Option<&mut ElementDescriptor>,
     ) -> HandlerResult {
         match token {
@@ -260,7 +275,7 @@ impl<'h> ContentHandlersDispatcher<'h> {
         }
     }
 
-    pub fn handle_end(&mut self, document_end: &mut DocumentEnd) -> HandlerResult {
+    pub fn handle_end(&mut self, document_end: &mut DocumentEnd<'_>) -> HandlerResult {
         self.end_handlers
             .do_for_each_active_and_remove(|h| h(document_end))
     }

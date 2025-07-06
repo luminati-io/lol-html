@@ -1,7 +1,12 @@
-use crate::base::Bytes;
-use encoding_rs::Encoding;
+use super::StreamingHandlerSink;
+use std::error::Error as StdError;
+use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::Mutex;
+
+type BoxResult = Result<(), Box<dyn StdError + Send + Sync>>;
 
 /// The type of inserted content.
+#[derive(Copy, Clone)]
 pub enum ContentType {
     /// HTML content type. The rewriter will insert the content as is.
     Html,
@@ -12,83 +17,170 @@ pub enum ContentType {
     Text,
 }
 
-#[inline]
-pub(super) fn content_to_bytes(
-    content: &str,
-    content_type: ContentType,
-    encoding: &'static Encoding,
-    mut output_handler: &mut dyn FnMut(&[u8]),
-) {
-    let bytes = Bytes::from_str(content, encoding);
-
-    match content_type {
-        ContentType::Html => output_handler(&bytes),
-        ContentType::Text => bytes.replace_byte3(
-            (b'<', b"&lt;"),
-            (b'>', b"&gt;"),
-            (b'&', b"&amp;"),
-            &mut output_handler,
-        ),
-    }
-}
-
-pub struct Mutations {
-    pub content_before: Vec<u8>,
-    pub replacement: Vec<u8>,
-    pub content_after: Vec<u8>,
+pub(crate) struct MutationsInner {
+    pub content_before: DynamicString,
+    pub replacement: DynamicString,
+    pub content_after: DynamicString,
     pub removed: bool,
-    encoding: &'static Encoding,
 }
 
-impl Mutations {
+impl MutationsInner {
     #[inline]
-    pub fn new(encoding: &'static Encoding) -> Self {
-        Mutations {
-            content_before: Vec::default(),
-            replacement: Vec::default(),
-            content_after: Vec::default(),
-            removed: false,
-            encoding,
-        }
-    }
-
-    #[inline]
-    pub fn before(&mut self, content: &str, content_type: ContentType) {
-        content_to_bytes(content, content_type, self.encoding, &mut |c| {
-            self.content_before.extend_from_slice(c);
-        });
-    }
-
-    #[inline]
-    pub fn after(&mut self, content: &str, content_type: ContentType) {
-        let mut pos = 0;
-
-        content_to_bytes(content, content_type, self.encoding, &mut |c| {
-            self.content_after.splice(pos..pos, c.iter().cloned());
-
-            pos += c.len();
-        });
-    }
-
-    #[inline]
-    pub fn replace(&mut self, content: &str, content_type: ContentType) {
-        let mut replacement = Vec::default();
-
-        content_to_bytes(content, content_type, self.encoding, &mut |c| {
-            replacement.extend_from_slice(c);
-        });
-
-        self.replacement = replacement;
+    pub fn replace(&mut self, chunk: StringChunk) {
         self.remove();
+        self.replacement.clear();
+        self.replacement.push_back(chunk);
     }
 
     #[inline]
     pub fn remove(&mut self) {
         self.removed = true;
     }
+}
+
+pub(crate) struct Mutations {
+    inner: Option<Box<MutationsInner>>,
+}
+
+impl Mutations {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { inner: None }
+    }
+
+    #[inline]
+    pub fn take(&mut self) -> Option<Box<MutationsInner>> {
+        self.inner.take()
+    }
+
+    #[inline]
+    pub fn if_mutated(&mut self) -> Option<&mut MutationsInner> {
+        self.inner.as_deref_mut()
+    }
+
+    #[inline]
+    pub fn mutate(&mut self) -> &mut MutationsInner {
+        #[inline(never)]
+        fn alloc_content(inner: &mut Option<Box<MutationsInner>>) -> &mut MutationsInner {
+            inner.get_or_insert_with(move || {
+                Box::new(MutationsInner {
+                    content_before: DynamicString::new(),
+                    replacement: DynamicString::new(),
+                    content_after: DynamicString::new(),
+                    removed: false,
+                })
+            })
+        }
+
+        match &mut self.inner {
+            Some(inner) => inner,
+            uninit => alloc_content(uninit),
+        }
+    }
 
     #[inline]
     pub fn removed(&self) -> bool {
-        self.removed
+        self.inner.as_ref().is_some_and(|inner| inner.removed)
+    }
+}
+
+/// Part of [`DynamicString`]
+pub(crate) enum StringChunk {
+    Buffer(Box<str>, ContentType),
+    // The mutex is never actually locked, but makes the struct `Sync` without unsafe.
+    Stream(Mutex<Box<dyn StreamingHandler + Send>>),
+}
+
+impl StringChunk {
+    pub(crate) fn from_str(content: impl Into<Box<str>>, content_type: ContentType) -> Self {
+        Self::Buffer(content.into(), content_type)
+    }
+
+    #[inline]
+    pub(crate) fn stream(handler: Box<dyn StreamingHandler + Send>) -> Self {
+        Self::Stream(Mutex::new(handler))
+    }
+}
+
+/// String built from fragments or dynamic callbacks
+#[derive(Default)]
+pub(crate) struct DynamicString {
+    chunks: Vec<StringChunk>,
+}
+
+impl DynamicString {
+    #[inline]
+    pub const fn new() -> Self {
+        Self { chunks: vec![] }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+    }
+
+    #[inline]
+    pub fn push_front(&mut self, chunk: StringChunk) {
+        self.chunks.insert(0, chunk);
+    }
+
+    #[inline]
+    pub fn push_back(&mut self, chunk: StringChunk) {
+        self.chunks.push(chunk);
+    }
+
+    pub fn encode(self, sink: &mut StreamingHandlerSink<'_>) -> BoxResult {
+        for chunk in self.chunks {
+            match chunk {
+                StringChunk::Buffer(content, content_type) => {
+                    sink.write_str(&content, content_type);
+                }
+                StringChunk::Stream(handler) => {
+                    // The mutex will never be locked or poisoned. This is the cheapest way to unwrap it.
+                    let (Ok(h) | Err(h)) = handler
+                        .into_inner()
+                        .map_err(std::sync::PoisonError::into_inner);
+                    h.write_all(sink)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A callback used to write content asynchronously.
+///
+/// Use the [`streaming!`] macro to construct it.
+pub trait StreamingHandler {
+    /// This method is called only once, and is expected to write content
+    /// by calling the [`sink.write_str()`](StreamingHandlerSink::write_str) one or more times.
+    ///
+    /// Multiple calls to `sink.write_str()` append more content to the output.
+    ///
+    /// See [`StreamingHandlerSink`].
+    fn write_all(self: Box<Self>, sink: &mut StreamingHandlerSink<'_>) -> BoxResult;
+}
+
+impl RefUnwindSafe for StringChunk {}
+impl UnwindSafe for StringChunk {}
+
+impl<F> From<F> for Box<dyn StreamingHandler + Send>
+where
+    F: FnOnce(&mut StreamingHandlerSink<'_>) -> BoxResult + Send + 'static,
+{
+    #[inline]
+    fn from(f: F) -> Self {
+        Box::new(f)
+    }
+}
+
+impl<F> StreamingHandler for F
+where
+    F: FnOnce(&mut StreamingHandlerSink<'_>) -> BoxResult + Send + 'static,
+{
+    #[inline]
+    fn write_all(self: Box<F>, sink: &mut StreamingHandlerSink<'_>) -> BoxResult {
+        (self)(sink)
     }
 }
